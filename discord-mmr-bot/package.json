@@ -1,0 +1,17 @@
+{
+  "name": "discord-mmr-bot",
+  "version": "1.0.0",
+  "description": "Discord tournament bot with MMR system",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "sqlite3": "^5.1.7",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}
