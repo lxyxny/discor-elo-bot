@@ -1066,7 +1066,6 @@ const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
   }
 })();
 
-// 🔁 Main interaction handler with deferral & error safety
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
