@@ -1,17 +1,19 @@
 {
-  "name": "discord-mmr-bot",
-  "version": "1.0.0",
-  "description": "Discord tournament bot with MMR system",
-  "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
   "dependencies": {
-    "discord.js": "^14.15.3",
-    "sqlite3": "^5.1.7",
-    "dotenv": "^16.4.5"
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.3",
+    "sqlite3": "^5.1.7"
   },
-  "engines": {
-    "node": "20.x"
-  }
+  "name": "discord-elo-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+   "start": "node bot.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
 }
