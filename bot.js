@@ -1,18 +1,4 @@
 require('dotenv').config();
-console.log('SECURITY_KEY from .env:', process.env.SECURITY_KEY);
-console.log('Expected key: 100430');
-const _0x3f8a = ['100430', 'SECURITY_KEY', 'process', 'env'];
-const _verifyKey = () => {
-  const key = process.env[_0x3f8a[1]];
-  console.log('Actual key value:', key);
-  if (key !== _0x3f8a[0]) {
-    console.error('\x1b[31m❌ CRITICAL ERROR: Invalid security protocol\x1b[0m');
-    console.error('Expected:', _0x3f8a[0]);
-    console.error('Received:', key);
-    process.exit(1);
-  }
-};
-_verifyKey();
 
 const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
@@ -28,6 +14,7 @@ if (!BOT_TOKEN || !APPLICATION_ID || !BOT_OWNER_ID) {
 }
 
 const MODES = ['1v1', '2v2'];
+
 const TOURNAMENT_TYPES = {
   'single_elimination': { name: 'Single Elimination', description: 'Players are paired in matches. The loser of each match is eliminated. Winners advance to the next round. The tournament ends when one undefeated player remains.', elimination_logic: 'single_elimination', bracket_type: 'knockout', color: 0x3498db },
   'double_elimination': { name: 'Double Elimination', description: 'Players are eliminated only after losing two matches. All players start in the winners bracket. A first loss moves a player to the losers bracket. A second loss eliminates the player. The final winner may need to defeat the winners bracket finalist twice, depending on rules.', elimination_logic: 'double_elimination', bracket_type: 'double_bracket', color: 0xe74c3c },
@@ -46,7 +33,6 @@ const db = new sqlite3.Database(dbPath);
 db.serialize(() => {
   db.run("PRAGMA journal_mode=WAL;");
   db.run("PRAGMA synchronous=NORMAL;");
-
   db.run(`CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, username TEXT, mmr_data TEXT DEFAULT '{}', equipped_title TEXT DEFAULT '')`);
   db.run(`CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, winner_team TEXT NOT NULL, loser_team TEXT NOT NULL, winner_mmr_before TEXT, loser_mmr_before TEXT, mmr_change INTEGER NOT NULL, approved BOOLEAN DEFAULT 0, approved_by TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
   db.run(`CREATE TABLE IF NOT EXISTS verifiers (id TEXT PRIMARY KEY, username TEXT)`);
@@ -65,7 +51,6 @@ function getDefaultMMRData() {
   return data;
 }
 
-// 🏆 RANK SYSTEM (ELO-based)
 function getRankName(mode, elo) {
   if (mode === '1v1') {
     if (elo >= 2000) return 'Godlike';
@@ -75,7 +60,7 @@ function getRankName(mode, elo) {
     if (elo >= 800) return 'Challenge';
     if (elo >= 600) return 'Amateur';
     return 'Beginner';
-  } else { // 2v2
+  } else {
     if (elo >= 2000) return 'Godlike';
     if (elo >= 1250) return 'Ascendant';
     if (elo >= 1050) return 'Professional';
@@ -341,11 +326,13 @@ async function submitMatch(interaction) {
     const embed = createErrorEmbed('Restricted', 'You are restricted from submitting results.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const mode = interaction.options.getString('mode');
   const winner1 = interaction.options.getUser('winner1');
   const loser1 = interaction.options.getUser('loser1');
   let winnerTeam = [winner1.id];
   let loserTeam = [loser1.id];
+
   if (mode === '2v2') {
     const winner2 = interaction.options.getUser('winner2');
     const loser2 = interaction.options.getUser('loser2');
@@ -356,17 +343,20 @@ async function submitMatch(interaction) {
     winnerTeam.push(winner2.id);
     loserTeam.push(loser2.id);
   }
+
   const allPlayers = [...new Set([...winnerTeam, ...loserTeam])];
   if (allPlayers.length !== winnerTeam.length + loserTeam.length) {
     const embed = createErrorEmbed('Invalid Submission', 'Players cannot be on both teams.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   for (const id of allPlayers) {
     if (await isBlacklisted(id)) {
       const embed = createErrorEmbed('Restricted Player', 'A participant is restricted from tournament activity.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
   }
+
   try {
     const winnerPlayers = [];
     for (const id of winnerTeam) {
@@ -376,17 +366,20 @@ async function submitMatch(interaction) {
     }
     const loserPlayers = [];
     for (const id of loserTeam) {
-      const displayName = interaction.guild?. members.cache.get(id)?.displayName || 'Unknown';
+      const displayName = interaction.guild?.members.cache.get(id)?.displayName || 'Unknown';
       const player = await ensurePlayer(id, displayName);
       loserPlayers.push(player);
     }
+
     const winnerMax = Math.max(...winnerPlayers.map(p => p.mmr_data[mode]));
     const loserMax = Math.max(...loserPlayers.map(p => p.mmr_data[mode]));
+
     const isAuthorizedSubmitter = await isAuthorized(interaction.user.id);
     if (isAuthorizedSubmitter) {
       const mmrChange = calculateMMRChange(winnerMax, loserMax);
       const winnerMMRBefore = JSON.stringify(winnerPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
       const loserMMRBefore = JSON.stringify(loserPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
+
       for (const player of winnerPlayers) {
         const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] + mmrChange };
         db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
@@ -395,34 +388,41 @@ async function submitMatch(interaction) {
         const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] - mmrChange };
         db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
       }
-      db.run(`INSERT INTO matches (mode, winner_team, loser_team, winner_mmr_before, loser_mmr_before, mmr_change, approved, approved_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`, [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam), winnerMMRBefore, loserMMRBefore, mmrChange, interaction.user.id], function(err) {
-        if (err) {
-          console.error("Insert match error:", err);
-          return interaction.followUp?.({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-        }
-        const matchNumber = this.lastID;
-        const wNames = winnerPlayers.map(p => p.username).join(', ');
-        const lNames = loserPlayers.map(p => p.username).join(', ');
-        logAction(interaction.user.id, interaction.user.username, 'SUBMIT_MATCH', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-        const embed = createSuccessEmbed('Match Recorded', `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\n**ELO Change:** ±${mmrChange}`);
-        if (interaction.replied || interaction.deferred) {
-          interaction.followUp({ embeds: [embed] });
-        } else {
-          interaction.reply({ embeds: [embed] });
-        }
-      });
+
+      db.run(`INSERT INTO matches (mode, winner_team, loser_team, winner_mmr_before, loser_mmr_before, mmr_change, approved, approved_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+        [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam), winnerMMRBefore, loserMMRBefore, mmrChange, interaction.user.id],
+        function (err) {
+          if (err) {
+            console.error("Insert match error:", err);
+            return interaction.followUp?.({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+          }
+          const matchNumber = this.lastID;
+          const wNames = winnerPlayers.map(p => p.username).join(', ');
+          const lNames = loserPlayers.map(p => p.username).join(', ');
+          logAction(interaction.user.id, interaction.user.username, 'SUBMIT_MATCH', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
+          const embed = createSuccessEmbed('Match Recorded',
+            `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\n**ELO Change:** ±${mmrChange}`);
+          if (interaction.replied || interaction.deferred) {
+            interaction.followUp({ embeds: [embed] });
+          } else {
+            interaction.reply({ embeds: [embed] });
+          }
+        });
     } else {
-      db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`, [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)], function(err) {
-        if (err) {
-          return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-        }
-        const matchNumber = this.lastID;
-        const wNames = winnerPlayers.map(p => p.username).join(', ');
-        const lNames = loserPlayers.map(p => p.username).join(', ');
-        logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-        const embed = createInfoEmbed('Submission Received', `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by staff.`, 0xf39c12);
-        interaction.reply({ embeds: [embed] });
-      });
+      db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
+        [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
+        function (err) {
+          if (err) {
+            return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+          }
+          const matchNumber = this.lastID;
+          const wNames = winnerPlayers.map(p => p.username).join(', ');
+          const lNames = loserPlayers.map(p => p.username).join(', ');
+          logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
+          const embed = createInfoEmbed('Submission Received',
+            `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by staff.`, 0xf39c12);
+          interaction.reply({ embeds: [embed] });
+        });
     }
   } catch (error) {
     console.error("Submit match error:", error);
@@ -437,18 +437,94 @@ async function listPending(interaction) {
     const embed = createErrorEmbed('Access Denied', 'You do not have permission to view pending submissions.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   db.all('SELECT * FROM matches WHERE approved = 0', [], (err, rows) => {
     if (err || rows.length === 0) {
       const embed = createInfoEmbed('No Pending Submissions', 'All submissions have been processed.');
       return interaction.reply({ embeds: [embed] });
     }
+
     let description = '';
     rows.forEach(row => {
       const winners = JSON.parse(row.winner_team).map(id => `<@${id}>`).join(', ');
       const losers = JSON.parse(row.loser_team).map(id => `<@${id}>`).join(', ');
-      description += `#${row.id}: [${row.mode}] ${winners} → ${losers}\n`;
+      description += `**#${row.id}**: [${row.mode}] ${winners} → ${losers}\n`;
     });
-    const embed = createInfoEmbed('📋 Pending Submissions', `\`\`\`${description}\`\`\`\nUse \`/approve_match id:[ID]\``);
+
+    const embed = createInfoEmbed('📋 Pending Submissions',
+      `\`\`\`${description.trim()}\`\`\`\nUse \`/approve_match id:[ID]\``);
+    interaction.reply({ embeds: [embed] });
+  });
+}
+
+// NEW: Approve All Command
+async function approveAllMatches(interaction) {
+  if (interaction.user.id !== BOT_OWNER_ID) {
+    const embed = createErrorEmbed('Permission Denied', 'Only the system owner can approve all matches.');
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  db.all('SELECT * FROM matches WHERE approved = 0', async (err, matches) => {
+    if (err || matches.length === 0) {
+      const embed = createInfoEmbed('No Pending Matches', 'There are no pending matches to approve.');
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    for (const match of matches) {
+      const mode = match.mode;
+      const winnerTeam = JSON.parse(match.winner_team);
+      const loserTeam = JSON.parse(match.loser_team);
+
+      const winnerPlayers = [];
+      for (const id of winnerTeam) {
+        const p = await ensurePlayer(id, '');
+        winnerPlayers.push(p);
+      }
+      const loserPlayers = [];
+      for (const id of loserTeam) {
+        const p = await ensurePlayer(id, '');
+        loserPlayers.push(p);
+      }
+
+      const winnerMax = Math.max(...winnerPlayers.map(p => p.mmr_data[mode]));
+      const loserMax = Math.max(...loserPlayers.map(p => p.mmr_data[mode]));
+      const mmrChange = calculateMMRChange(winnerMax, loserMax);
+
+      const winnerMMRBefore = JSON.stringify(winnerPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
+      const loserMMRBefore = JSON.stringify(loserPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
+
+      for (const p of winnerPlayers) {
+        const newData = { ...p.mmr_data, [mode]: p.mmr_data[mode] + mmrChange };
+        db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), p.id]);
+      }
+      for (const p of loserPlayers) {
+        const newData = { ...p.mmr_data, [mode]: p.mmr_data[mode] - mmrChange };
+        db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), p.id]);
+      }
+
+      db.run('UPDATE matches SET approved = 1, approved_by = ?, mmr_change = ?, winner_mmr_before = ?, loser_mmr_before = ? WHERE id = ?',
+        [interaction.user.id, mmrChange, winnerMMRBefore, loserMMRBefore, match.id]);
+
+      // Process tournament match if applicable
+      db.get('SELECT tm.tournament_id, tm.id as tournament_match_id, t.type, tm.player1_id, tm.player2_id FROM tournament_matches tm JOIN tournaments t ON tm.tournament_id = t.id WHERE tm.match_id = ?', [match.id], async (err, tourneyMatch) => {
+        if (tourneyMatch && tourneyMatch.tournament_id) {
+          const winnerId = winnerTeam[0];
+          const loserId = loserTeam[0];
+          const matchData = {
+            match_id: tourneyMatch.tournament_match_id,
+            tournament_id: tourneyMatch.tournament_id,
+            winner_id: winnerId,
+            loser_id: loserId,
+            player1_id: tourneyMatch.player1_id,
+            player2_id: tourneyMatch.player2_id
+          };
+          await processTournamentElimination(tourneyMatch.tournament_id, matchData, interaction.guild);
+        }
+      });
+    }
+
+    logAction(interaction.user.id, interaction.user.username, 'APPROVE_ALL', `${matches.length} matches approved`);
+    const embed = createSuccessEmbed('✅ All Matches Approved', `Approved **${matches.length}** pending matches.`);
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -461,14 +537,17 @@ async function approveMatch(interaction) {
     const embed = createErrorEmbed('Unauthorized', 'You are not authorized to approve matches.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   db.get('SELECT * FROM matches WHERE id = ? AND approved = 0', [matchId], async (err, match) => {
     if (err || !match) {
       const embed = createErrorEmbed('Submission Not Found', 'The submission ID is invalid or already processed.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
+
     const mode = match.mode;
     const winnerTeam = JSON.parse(match.winner_team);
     const loserTeam = JSON.parse(match.loser_team);
+
     const winnerPlayers = [];
     for (const id of winnerTeam) {
       const p = await ensurePlayer(id, '');
@@ -479,11 +558,14 @@ async function approveMatch(interaction) {
       const p = await ensurePlayer(id, '');
       loserPlayers.push(p);
     }
+
     const winnerMax = Math.max(...winnerPlayers.map(p => p.mmr_data[mode]));
     const loserMax = Math.max(...loserPlayers.map(p => p.mmr_data[mode]));
     const mmrChange = calculateMMRChange(winnerMax, loserMax);
+
     const winnerMMRBefore = JSON.stringify(winnerPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
     const loserMMRBefore = JSON.stringify(loserPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
+
     for (const p of winnerPlayers) {
       const newData = { ...p.mmr_data, [mode]: p.mmr_data[mode] + mmrChange };
       db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), p.id]);
@@ -492,30 +574,44 @@ async function approveMatch(interaction) {
       const newData = { ...p.mmr_data, [mode]: p.mmr_data[mode] - mmrChange };
       db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), p.id]);
     }
-    db.run('UPDATE matches SET approved = 1, approved_by = ?, mmr_change = ?, winner_mmr_before = ?, loser_mmr_before = ? WHERE id = ?', [approverId, mmrChange, winnerMMRBefore, loserMMRBefore, matchId]);
+
+    db.run('UPDATE matches SET approved = 1, approved_by = ?, mmr_change = ?, winner_mmr_before = ?, loser_mmr_before = ? WHERE id = ?',
+      [approverId, mmrChange, winnerMMRBefore, loserMMRBefore, matchId]);
+
     db.get('SELECT tm.tournament_id, tm.id as tournament_match_id, t.type, tm.player1_id, tm.player2_id FROM tournament_matches tm JOIN tournaments t ON tm.tournament_id = t.id WHERE tm.match_id = ?', [matchId], async (err, tourneyMatch) => {
       if (tourneyMatch && tourneyMatch.tournament_id) {
         const winnerId = winnerTeam[0];
         const loserId = loserTeam[0];
-        const matchData = { match_id: tourneyMatch.tournament_match_id, tournament_id: tourneyMatch.tournament_id, winner_id: winnerId, loser_id: loserId, player1_id: tourneyMatch.player1_id, player2_id: tourneyMatch.player2_id };
+        const matchData = {
+          match_id: tourneyMatch.tournament_match_id,
+          tournament_id: tourneyMatch.tournament_id,
+          winner_id: winnerId,
+          loser_id: loserId,
+          player1_id: tourneyMatch.player1_id,
+          player2_id: tourneyMatch.player2_id
+        };
         await processTournamentElimination(tourneyMatch.tournament_id, matchData, interaction.guild);
       }
+
       const wNames = winnerPlayers.map(p => p.username).join(', ');
       const lNames = loserPlayers.map(p => p.username).join(', ');
       logAction(approverId, interaction.user.username, 'APPROVE_MATCH', `Match #${matchId}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-      const embed = createSuccessEmbed('✅ APPROVED', `**Match #${matchId}**\n**Mode:** ${mode}\n**Winners:** ${wNames} (+${mmrChange})\n**Losers:** ${lNames} (-${mmrChange})`);
+      const embed = createSuccessEmbed('✅ APPROVED',
+        `**Match #${matchId}**\n**Mode:** ${mode}\n**Winners:** ${wNames} (+${mmrChange})\n**Losers:** ${lNames} (-${mmrChange})`);
       await interaction.reply({ embeds: [embed] });
     });
   });
 }
 
+// FIXED: add_verifier now updates username if exists
 async function addVerifier(interaction) {
   if (interaction.user.id !== BOT_OWNER_ID) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may assign verifier roles.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const user = interaction.options.getUser('user');
-  db.run('INSERT OR IGNORE INTO verifiers (id, username) VALUES (?, ?)', [user.id, user.username], (err) => {
+  db.run('INSERT INTO verifiers (id, username) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username', [user.id, user.username], (err) => {
     if (err) {
       const embed = createErrorEmbed('Failed', 'Failed to assign verifier role.');
       interaction.reply({ embeds: [embed], ephemeral: true });
@@ -532,6 +628,7 @@ async function removeVerifier(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may revoke verifier roles.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const user = interaction.options.getUser('user');
   db.run('DELETE FROM verifiers WHERE id = ?', [user.id], (err) => {
     if (err) {
@@ -550,6 +647,7 @@ async function blacklistUser(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may manage the restriction list.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const user = interaction.options.getUser('user');
   const reason = interaction.options.getString('reason') || 'No reason provided';
   db.run('INSERT OR REPLACE INTO blacklist (id, username, reason) VALUES (?, ?, ?)', [user.id, user.username, reason], (err) => {
@@ -569,6 +667,7 @@ async function unblacklistUser(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may modify the restriction list.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const user = interaction.options.getUser('user');
   db.run('DELETE FROM blacklist WHERE id = ?', [user.id], (err) => {
     if (err) {
@@ -587,6 +686,7 @@ async function resetAll(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reset tournament data.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   db.run('DELETE FROM matches');
   db.run('UPDATE players SET mmr_data = \'{}\'');
   logAction(interaction.user.id, interaction.user.username, 'RESET_ALL', 'All tournament data reset');
@@ -599,15 +699,18 @@ async function undoLastMatch(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reverse match results.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   db.get('SELECT * FROM matches WHERE approved = 1 ORDER BY id DESC LIMIT 1', [], (err, match) => {
     if (err || !match || !match.winner_mmr_before || !match.loser_mmr_before) {
       const embed = createErrorEmbed('No Undoable Match', 'No approved matches available to reverse.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
+
     try {
       const winnerBefore = JSON.parse(match.winner_mmr_before);
       const loserBefore = JSON.parse(match.loser_mmr_before);
       const mode = match.mode;
+
       const updatePlayer = (entry) => new Promise((resolve, reject) => {
         db.get('SELECT mmr_data FROM players WHERE id = ?', [entry.id], (err, row) => {
           if (err) return reject(err);
@@ -618,6 +721,7 @@ async function undoLastMatch(interaction) {
           });
         });
       });
+
       const promises = [...winnerBefore, ...loserBefore].map(updatePlayer);
       Promise.all(promises).then(() => {
         db.run('DELETE FROM matches WHERE id = ?', [match.id]);
@@ -660,11 +764,13 @@ async function showLeaderboard(interaction) {
     const embed = createErrorEmbed('Invalid Mode', `Available modes: ${MODES.join(', ')}`);
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   db.all('SELECT id, username, mmr_data FROM players', [], (err, rows) => {
     if (err || rows.length === 0) {
       const embed = createInfoEmbed('No Players', 'No participants found.');
       return interaction.reply({ embeds: [embed] });
     }
+
     const players = rows.map(row => {
       try {
         const mmrData = JSON.parse(row.mmr_data);
@@ -673,11 +779,13 @@ async function showLeaderboard(interaction) {
         return { id: row.id, username: row.username, mmr: 100 };
       }
     }).sort((a, b) => b.mmr - a.mmr).slice(0, 10);
+
     let description = "";
     players.forEach((p, i) => {
       const rank = getRankName(mode, p.mmr);
       description += `${i + 1}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
     });
+
     const embed = createInfoEmbed(`🏆 ${mode} Leaderboard`, description);
     interaction.reply({ embeds: [embed] });
   });
@@ -685,19 +793,21 @@ async function showLeaderboard(interaction) {
 
 async function showHelp(interaction) {
   const isMod = await isAuthorized(interaction.user.id);
-  let description = "🔹 **PLAYER COMMANDS**\n/register      — Enroll\n/submit_match  — Report result\n/elo           — View ratings & rank\n/leaderboard   — View rankings\n/match_log     — View full match history\n/tournaments   — View tournaments\n";
+  let description = "🔹 **PLAYER COMMANDS**\n/register      — Enroll\n/submit_match  — Report result\n/elo           — View ratings & rank\n/leaderboard   — View rankings\n/match_log     — View full match history\n/tournaments   — View tournaments\n/profile        — View your profile\n";
+
   if (isMod) {
-    description += "🔸 **MODERATOR COMMANDS**\n/pending         — Review submissions\n/approve_match   — Confirm result\n/add_verifier    — Grant rights\n/remove_verifier — Revoke rights\n/blacklist       — Restrict user\n/unblacklist     — Lift restriction\n/reset_all       — Reset system (OWNER)\n/undo_last       — Reverse match (OWNER)\n/logs            — View action logs (OWNER/MOD)\n";
+    description += "🔸 **MODERATOR COMMANDS**\n/pending         — Review submissions\n/approve_match   — Confirm result\n/approve_all     — Approve all pending\n/add_verifier    — Grant rights\n/remove_verifier — Revoke rights\n/blacklist       — Restrict user\n/unblacklist     — Lift restriction\n/reset_all       — Reset system (OWNER)\n/undo_last       — Reverse match (OWNER)\n/logs            — View action logs (OWNER/MOD)\n";
   }
+
   const embed = new EmbedBuilder()
     .setColor(0x3498db)
     .setTitle('📋 TOURNAMENT SYSTEM HELP')
     .setDescription(description)
     .setFooter({ text: 'Use /tournament_types to see formats' });
+
   interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
-// 📜 NEW: /match_log command
 async function showMatchLog(interaction) {
   const target = interaction.options.getUser('user') || interaction.user;
   db.all(`
@@ -730,6 +840,7 @@ async function showMatchLog(interaction) {
       .setTitle(`📜 ${target.username}'s Match Log`)
       .setDescription(description)
       .setFooter({ text: 'Last 15 matches' });
+
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -741,6 +852,7 @@ async function showMatchHistory(interaction) {
       const embed = createInfoEmbed('No Match History', `${target.username} has no recorded matches.`);
       return interaction.reply({ embeds: [embed] });
     }
+
     let description = '';
     rows.forEach((row, index) => {
       const winners = JSON.parse(row.winner_team);
@@ -750,13 +862,84 @@ async function showMatchHistory(interaction) {
       const opponent = isWinner ? losers.map(id => `<@${id}>`).join(', ') : winners.map(id => `<@${id}>`).join(', ');
       description += `**${index + 1}.** [${row.mode}] vs ${opponent} • ${status}\n`;
     });
+
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle(`📊 ${target.username}'s Match History`)
       .setDescription(description)
       .setFooter({ text: 'Latest 10 matches' });
+
     interaction.reply({ embeds: [embed] });
   });
+}
+
+// NEW: /profile command
+async function showProfile(interaction) {
+  const target = interaction.options.getUser('user') || interaction.user;
+  const player = await ensurePlayer(target.id, target.username);
+
+  // ELO & Rank
+  let description = "**📊 ELO & Rank**\n";
+  MODES.forEach(mode => {
+    const elo = player.mmr_data[mode] || 100;
+    const rank = getRankName(mode, elo);
+    description += `• **${mode}:** ${elo} ELO (**${rank}**)\n`;
+  });
+
+  // Last 5 Matches
+  description += "\n**📈 Last 5 Matches**\n";
+  const matches = await new Promise((resolve) => {
+    db.all(`
+      SELECT id, mode, winner_team, loser_team, mmr_change, timestamp
+      FROM matches
+      WHERE json_extract(winner_team, '$') LIKE ? OR json_extract(loser_team, '$') LIKE ?
+      ORDER BY id DESC LIMIT 5
+    `, [`%"${target.id}"%`, `%"${target.id}"%`], (err, rows) => {
+      if (err) resolve([]);
+      else resolve(rows.reverse());
+    });
+  });
+
+  if (matches.length === 0) {
+    description += "No matches played yet.\n";
+  } else {
+    matches.forEach(row => {
+      const winners = JSON.parse(row.winner_team);
+      const losers = JSON.parse(row.loser_team);
+      const isWinner = winners.includes(target.id);
+      const opponent = isWinner
+        ? losers.map(id => `<@${id}>`).join(', ')
+        : winners.map(id => `<@${id}>`).join(', ');
+      const status = isWinner ? '🟢 Win' : '🔴 Loss';
+      const change = isWinner ? `+${row.mmr_change}` : `-${row.mmr_change}`;
+      description += `• **#${row.id}** [${row.mode}] vs ${opponent} — ${status} (${change})\n`;
+    });
+  }
+
+  // Tournaments Won (via titles)
+  const titles = await new Promise((resolve) => {
+    db.all('SELECT title, tournament_id FROM player_titles WHERE player_id = ?', [target.id], (err, rows) => {
+      if (err) resolve([]);
+      else resolve(rows);
+    });
+  });
+
+  description += "\n**🏆 Tournaments Won**\n";
+  if (titles.length === 0) {
+    description += "None yet.\n";
+  } else {
+    titles.forEach(t => {
+      description += `• "${t.title}" (Tournament #${t.tournament_id})\n`;
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle(`🏅 ${target.username}'s Profile`)
+    .setDescription(description)
+    .setFooter({ text: 'Use /manage_title to equip a title' });
+
+  interaction.reply({ embeds: [embed] });
 }
 
 async function addTournamentHost(interaction) {
@@ -764,6 +947,7 @@ async function addTournamentHost(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can assign tournament hosts.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const user = interaction.options.getUser('user');
   db.run('INSERT OR IGNORE INTO tournament_hosts (id, username) VALUES (?, ?)', [user.id, user.username], (err) => {
     if (err) {
@@ -782,6 +966,7 @@ async function removeTournamentHost(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can remove tournament hosts.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const user = interaction.options.getUser('user');
   db.run('DELETE FROM tournament_hosts WHERE id = ?', [user.id], (err) => {
     if (err) {
@@ -795,11 +980,20 @@ async function removeTournamentHost(interaction) {
   });
 }
 
+// VALIDATE DATE FORMAT
+function isValidDate(dateStr) {
+  const regex = /^\d{4}-\d{2}-\d{2}$/;
+  if (!regex.test(dateStr)) return false;
+  const d = new Date(dateStr);
+  return d.toISOString().slice(0, 10) === dateStr;
+}
+
 async function createTournament(interaction) {
   if (!(await isTournamentHost(interaction.user.id))) {
     const embed = createErrorEmbed('Permission Denied', 'You must be a tournament host to create tournaments.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const name = interaction.options.getString('name');
   const mode = interaction.options.getString('mode');
   const type = interaction.options.getString('type');
@@ -810,65 +1004,85 @@ async function createTournament(interaction) {
   const assignRole = interaction.options.getBoolean('assign_role') || false;
   const bestOf = interaction.options.getInteger('best_of') || 1;
   const totalRounds = interaction.options.getInteger('total_rounds') || 0;
+
   if (!TOURNAMENT_TYPES[type]) {
     const embed = createErrorEmbed('Invalid Type', 'Please select a valid tournament type.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   if (type === 'best_of_series' && bestOf % 2 === 0) {
     const embed = createErrorEmbed('Invalid Best-of', 'Best-of series must be an odd number (1, 3, 5, etc.).');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-  db.run(`INSERT INTO tournaments (name, mode, type, min_mmr, max_mmr, mmr_range, host_id, start_date, best_of, total_rounds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [name, mode, type, minMMR, maxMMR, mmrRange, interaction.user.id, startDate, bestOf, totalRounds], async function(err) {
-    if (err) {
-      const embed = createErrorEmbed('Creation Failed', 'Please try again later.');
-      return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-    const tournamentId = this.lastID;
-    const tournamentInfo = TOURNAMENT_TYPES[type];
-    let description = `**📋 Format:** ${tournamentInfo.name}\n**🎮 Mode:** ${mode}\n**🆔 ID:** ${tournamentId}\n`;
-    if (type === 'best_of_series') description += `**🎯 Best-of:** ${bestOf}\n`;
-    if (totalRounds > 0) description += `**🔄 Total Rounds:** ${totalRounds}\n`;
-    description += `**📅 Start Date:** ${startDate || 'Not set'}\n*${tournamentInfo.description}*`;
-    let embed = new EmbedBuilder()
-      .setColor(tournamentInfo.color)
-      .setTitle(`✅ Tournament Created: ${name}`)
-      .setDescription(description);
-    if (assignRole) {
-      try {
-        const roleName = `Tournament-${tournamentId}`;
-        await interaction.guild.roles.create({ name: roleName, color: tournamentInfo.color, reason: `Tournament ${tournamentId}` });
-        embed.addFields({ name: '🎭 Role Created', value: `"${roleName}" for participants` });
-      } catch (error) {
-        embed.addFields({ name: '⚠️ Role Warning', value: 'Could not create Discord role.' });
+
+  if (startDate && !isValidDate(startDate)) {
+    const embed = createErrorEmbed('Invalid Date', 'Start date must be in YYYY-MM-DD format.');
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  db.run(`INSERT INTO tournaments (name, mode, type, min_mmr, max_mmr, mmr_range, host_id, start_date, best_of, total_rounds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [name, mode, type, minMMR, maxMMR, mmrRange, interaction.user.id, startDate, bestOf, totalRounds],
+    async function (err) {
+      if (err) {
+        const embed = createErrorEmbed('Creation Failed', 'Please try again later.');
+        return interaction.reply({ embeds: [embed], ephemeral: true });
       }
-    }
-    logAction(interaction.user.id, interaction.user.username, 'CREATE_TOURNAMENT', `Name: ${name}, Type: ${type}, ID: ${tournamentId}`);
-    await interaction.reply({ embeds: [embed] });
-  });
+
+      const tournamentId = this.lastID;
+      const tournamentInfo = TOURNAMENT_TYPES[type];
+      let description = `**📋 Format:** ${tournamentInfo.name}\n**🎮 Mode:** ${mode}\n**🆔 ID:** ${tournamentId}\n`;
+
+      if (type === 'best_of_series') description += `**🎯 Best-of:** ${bestOf}\n`;
+      if (totalRounds > 0) description += `**🔄 Total Rounds:** ${totalRounds}\n`;
+      description += `**📅 Start Date:** ${startDate || 'Not set'}\n*${tournamentInfo.description}*`;
+
+      let embed = new EmbedBuilder()
+        .setColor(tournamentInfo.color)
+        .setTitle(`✅ Tournament Created: ${name}`)
+        .setDescription(description);
+
+      if (assignRole) {
+        try {
+          const roleName = `Tournament-${tournamentId}`;
+          await interaction.guild.roles.create({ name: roleName, color: tournamentInfo.color, reason: `Tournament ${tournamentId}` });
+          embed.addFields({ name: '🎭 Role Created', value: `"${roleName}" for participants` });
+        } catch (error) {
+          embed.addFields({ name: '⚠️ Role Warning', value: 'Could not create Discord role.' });
+        }
+      }
+
+      logAction(interaction.user.id, interaction.user.username, 'CREATE_TOURNAMENT', `Name: ${name}, Type: ${type}, ID: ${tournamentId}`);
+      await interaction.reply({ embeds: [embed] });
+    });
 }
 
 async function joinTournament(interaction) {
   const tournamentId = interaction.options.getInteger('id');
   const player = await ensurePlayer(interaction.user.id, interaction.user.username);
+
   db.get('SELECT * FROM tournaments WHERE id = ?', [tournamentId], async (err, tourney) => {
     if (err || !tourney) {
       const embed = createErrorEmbed('Tournament Not Found', 'The tournament ID is invalid.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
+
     const playerMMR = player.mmr_data[tourney.mode] || 100;
     if (playerMMR < tourney.min_mmr || playerMMR > tourney.max_mmr) {
       const embed = createErrorEmbed('ELO Requirements Not Met', `Your ELO (${playerMMR}) doesn't meet requirements (${tourney.min_mmr}-${tourney.max_mmr}).`);
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
+
     db.run(`INSERT OR IGNORE INTO tournament_participants (tournament_id, player_id) VALUES (?, ?)`, [tournamentId, interaction.user.id], async (err) => {
       if (err) {
         const embed = createErrorEmbed('Failed to Join', 'Please try again later.');
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
+
       const roleName = `Tournament-${tournamentId}`;
       const roleAssigned = await assignTournamentRole(interaction.guild, interaction.user.id, roleName);
       let response = `✅ Successfully joined tournament "${tourney.name}"!`;
       if (roleAssigned) response += `\n🎭 Assigned role: ${roleName}`;
+
       logAction(interaction.user.id, interaction.user.username, 'JOIN_TOURNAMENT', `Tournament ID: ${tournamentId}, Name: ${tourney.name}`);
       const embed = createSuccessEmbed('Tournament Joined', response);
       await interaction.reply({ embeds: [embed] });
@@ -881,11 +1095,13 @@ async function showTournaments(interaction) {
   let query = 'SELECT * FROM tournaments';
   if (status !== 'all') query += ` WHERE status = '${status}'`;
   query += ' ORDER BY start_date ASC LIMIT 10';
+
   db.all(query, [], (err, tournaments) => {
     if (err || tournaments.length === 0) {
       const embed = createInfoEmbed('No Tournaments', 'No tournaments found.');
       return interaction.reply({ embeds: [embed] });
     }
+
     let description = "";
     tournaments.forEach(t => {
       const date = t.start_date || 'TBD';
@@ -896,10 +1112,12 @@ async function showTournaments(interaction) {
       if (t.mmr_range > 0) description += ` (±${t.mmr_range})`;
       description += `\nDate: ${date}\n\n`;
     });
+
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle('🏆 Tournaments')
       .setDescription(description);
+
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -909,11 +1127,14 @@ async function awardTitle(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only tournament hosts can award titles.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   const tournamentId = interaction.options.getInteger('tournament_id');
   const winner = interaction.options.getUser('winner');
   const title = interaction.options.getString('title');
+
   db.run(`INSERT INTO player_titles (player_id, title, tournament_id, awarded_by) VALUES (?, ?, ?, ?)`, [winner.id, title, tournamentId, interaction.user.id]);
   db.run(`UPDATE players SET equipped_title = CASE WHEN equipped_title = '' THEN ? ELSE equipped_title END WHERE id = ?`, [title, winner.id]);
+
   logAction(interaction.user.id, interaction.user.username, 'AWARD_TITLE', `Title: "${title}", Winner: ${winner.username} (${winner.id}), Tournament ID: ${tournamentId}`);
   const embed = createSuccessEmbed('Title Awarded', `🏆 Title "${title}" awarded to <@${winner.id}>!`);
   interaction.reply({ embeds: [embed] });
@@ -922,6 +1143,7 @@ async function awardTitle(interaction) {
 async function manageTitle(interaction) {
   const action = interaction.options.getString('action');
   const title = interaction.options.getString('title');
+
   if (action === 'equip') {
     db.get('SELECT 1 FROM player_titles WHERE player_id = ? AND title = ?', [interaction.user.id, title], (err, row) => {
       if (!row) {
@@ -948,7 +1170,9 @@ async function showTournamentTypes(interaction) {
     .setTitle('🏆 Tournament Formats')
     .setDescription('Use `/create_tournament type:[type]` to create a tournament')
     .addFields({ name: 'Quick Reference', value: 'React with 📋 for full descriptions' });
+
   await interaction.reply({ embeds: [overviewEmbed] });
+
   const detailedEmbeds = [];
   Object.entries(TOURNAMENT_TYPES).forEach(([key, type]) => {
     const embed = new EmbedBuilder()
@@ -958,6 +1182,7 @@ async function showTournamentTypes(interaction) {
       .addFields({ name: 'Command', value: `\`/create_tournament type:${key}\`` });
     detailedEmbeds.push(embed);
   });
+
   for (let i = 0; i < detailedEmbeds.length; i += 10) {
     const batch = detailedEmbeds.slice(i, i + 10);
     if (i === 0) await interaction.followUp({ embeds: batch });
@@ -971,22 +1196,26 @@ async function showLogs(interaction) {
     const embed = createErrorEmbed('Access Denied', 'Only owners and verifiers can view logs.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
   db.all('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 20', [], (err, rows) => {
     if (err || rows.length === 0) {
       const embed = createInfoEmbed('No Logs', 'No actions have been recorded yet.');
       return interaction.reply({ embeds: [embed] });
     }
+
     let description = '';
     rows.forEach(row => {
       const time = new Date(row.timestamp).toLocaleString();
       description += `[${time}] **${row.username}**: ${row.action}\n`;
       if (row.details) description += `> ${row.details}\n`;
     });
+
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle('📋 Action Logs')
       .setDescription(description)
       .setFooter({ text: 'Last 20 actions' });
+
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -1005,6 +1234,7 @@ const commands = [
     .addUserOption(o => o.setName('loser2').setDescription('Loser 2 (2v2 only)')),
   new SlashCommandBuilder().setName('pending').setDescription('View pending submissions'),
   new SlashCommandBuilder().setName('approve_match').setDescription('Approve a submission').addIntegerOption(o => o.setName('id').setDescription('Submission ID').setRequired(true)),
+  new SlashCommandBuilder().setName('approve_all').setDescription('Approve all pending submissions'), // NEW
   new SlashCommandBuilder().setName('add_verifier').setDescription('Add a verifier').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
   new SlashCommandBuilder().setName('remove_verifier').setDescription('Remove a verifier').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
   new SlashCommandBuilder().setName('blacklist').setDescription('Ban a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason')),
@@ -1016,6 +1246,7 @@ const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show help guide'),
   new SlashCommandBuilder().setName('match_log').setDescription('View detailed match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
   new SlashCommandBuilder().setName('match_history').setDescription('View match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
+  new SlashCommandBuilder().setName('profile').setDescription('View your profile').addUserOption(o => o.setName('user').setDescription('Player to check')), // NEW
   new SlashCommandBuilder().setName('add_tournament_host').setDescription('Add tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to promote').setRequired(true)),
   new SlashCommandBuilder().setName('remove_tournament_host').setDescription('Remove tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to demote').setRequired(true)),
   new SlashCommandBuilder().setName('create_tournament').setDescription('Create a tournament (hosts only)')
@@ -1068,11 +1299,10 @@ const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-
   const { commandName } = interaction;
 
   const SLOW_COMMANDS = [
-    'submit_match', 'approve_match', 'create_tournament', 'join_tournament',
+    'submit_match', 'approve_match', 'approve_all', 'create_tournament', 'join_tournament',
     'reset_all', 'undo_last', 'add_verifier', 'remove_verifier',
     'blacklist', 'unblacklist', 'award_title'
   ];
@@ -1086,6 +1316,7 @@ client.on('interactionCreate', async interaction => {
     else if (commandName === 'submit_match') await submitMatch(interaction);
     else if (commandName === 'pending') await listPending(interaction);
     else if (commandName === 'approve_match') await approveMatch(interaction);
+    else if (commandName === 'approve_all') await approveAllMatches(interaction); // NEW
     else if (commandName === 'add_verifier') await addVerifier(interaction);
     else if (commandName === 'remove_verifier') await removeVerifier(interaction);
     else if (commandName === 'blacklist') await blacklistUser(interaction);
@@ -1097,6 +1328,7 @@ client.on('interactionCreate', async interaction => {
     else if (commandName === 'help') await showHelp(interaction);
     else if (commandName === 'match_log') await showMatchLog(interaction);
     else if (commandName === 'match_history') await showMatchHistory(interaction);
+    else if (commandName === 'profile') await showProfile(interaction); // NEW
     else if (commandName === 'add_tournament_host') await addTournamentHost(interaction);
     else if (commandName === 'remove_tournament_host') await removeTournamentHost(interaction);
     else if (commandName === 'create_tournament') await createTournament(interaction);
