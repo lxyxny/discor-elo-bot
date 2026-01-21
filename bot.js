@@ -1,13 +1,10 @@
 require('dotenv').config();
-
 const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-
 const BOT_OWNER_ID = process.env.BOT_OWNER_ID;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const APPLICATION_ID = process.env.APPLICATION_ID;
-
 if (!BOT_TOKEN || !APPLICATION_ID || !BOT_OWNER_ID) {
   console.error('❌ Missing required environment variables. Check your .env file.');
   process.exit(1);
@@ -43,7 +40,28 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS tournament_matches (id INTEGER PRIMARY KEY AUTOINCREMENT, tournament_id INTEGER, match_id INTEGER, round INTEGER, match_type TEXT, player1_id TEXT, player2_id TEXT, winner_id TEXT, games_won_p1 INTEGER DEFAULT 0, games_won_p2 INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', bracket_position TEXT, FOREIGN KEY (tournament_id) REFERENCES tournaments(id))`);
   db.run(`CREATE TABLE IF NOT EXISTS player_titles (player_id TEXT, title TEXT, tournament_id INTEGER, awarded_by TEXT, awarded_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (player_id) REFERENCES players(id), FOREIGN KEY (tournament_id) REFERENCES tournaments(id))`);
   db.run(`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, username TEXT, action TEXT, details TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+  // New metadata table for laddermate timestamp
+  db.run(`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)`);
 });
+
+// ===== Metadata Helpers =====
+function setMetadata(key, value) {
+  return new Promise((resolve, reject) => {
+    db.run('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)', [key, value], function(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function getMetadata(key, defaultValue = null) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT value FROM metadata WHERE key = ?', [key], (err, row) => {
+      if (err) reject(err);
+      else resolve(row ? row.value : defaultValue);
+    });
+  });
+}
 
 function getDefaultMMRData() {
   const data = {};
@@ -437,20 +455,17 @@ async function listPending(interaction) {
     const embed = createErrorEmbed('Access Denied', 'You do not have permission to view pending submissions.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   db.all('SELECT * FROM matches WHERE approved = 0', [], (err, rows) => {
     if (err || rows.length === 0) {
       const embed = createInfoEmbed('No Pending Submissions', 'All submissions have been processed.');
       return interaction.reply({ embeds: [embed] });
     }
-
     let description = '';
     rows.forEach(row => {
       const winners = JSON.parse(row.winner_team).map(id => `<@${id}>`).join(', ');
       const losers = JSON.parse(row.loser_team).map(id => `<@${id}>`).join(', ');
       description += `**#${row.id}**: [${row.mode}] ${winners} → ${losers}\n`;
     });
-
     const embed = createInfoEmbed('📋 Pending Submissions',
       `\`\`\`${description.trim()}\`\`\`\nUse \`/approve_match id:[ID]\``);
     interaction.reply({ embeds: [embed] });
@@ -463,13 +478,11 @@ async function approveAllMatches(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner can approve all matches.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   db.all('SELECT * FROM matches WHERE approved = 0', async (err, matches) => {
     if (err || matches.length === 0) {
       const embed = createInfoEmbed('No Pending Matches', 'There are no pending matches to approve.');
       return interaction.reply({ embeds: [embed] });
     }
-
     for (const match of matches) {
       const mode = match.mode;
       const winnerTeam = JSON.parse(match.winner_team);
@@ -522,7 +535,6 @@ async function approveAllMatches(interaction) {
         }
       });
     }
-
     logAction(interaction.user.id, interaction.user.username, 'APPROVE_ALL', `${matches.length} matches approved`);
     const embed = createSuccessEmbed('✅ All Matches Approved', `Approved **${matches.length}** pending matches.`);
     interaction.reply({ embeds: [embed] });
@@ -537,13 +549,11 @@ async function approveMatch(interaction) {
     const embed = createErrorEmbed('Unauthorized', 'You are not authorized to approve matches.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   db.get('SELECT * FROM matches WHERE id = ? AND approved = 0', [matchId], async (err, match) => {
     if (err || !match) {
       const embed = createErrorEmbed('Submission Not Found', 'The submission ID is invalid or already processed.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
-
     const mode = match.mode;
     const winnerTeam = JSON.parse(match.winner_team);
     const loserTeam = JSON.parse(match.loser_team);
@@ -592,7 +602,6 @@ async function approveMatch(interaction) {
         };
         await processTournamentElimination(tourneyMatch.tournament_id, matchData, interaction.guild);
       }
-
       const wNames = winnerPlayers.map(p => p.username).join(', ');
       const lNames = loserPlayers.map(p => p.username).join(', ');
       logAction(approverId, interaction.user.username, 'APPROVE_MATCH', `Match #${matchId}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
@@ -609,7 +618,6 @@ async function addVerifier(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may assign verifier roles.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const user = interaction.options.getUser('user');
   db.run('INSERT INTO verifiers (id, username) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username', [user.id, user.username], (err) => {
     if (err) {
@@ -628,7 +636,6 @@ async function removeVerifier(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may revoke verifier roles.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const user = interaction.options.getUser('user');
   db.run('DELETE FROM verifiers WHERE id = ?', [user.id], (err) => {
     if (err) {
@@ -647,7 +654,6 @@ async function blacklistUser(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may manage the restriction list.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const user = interaction.options.getUser('user');
   const reason = interaction.options.getString('reason') || 'No reason provided';
   db.run('INSERT OR REPLACE INTO blacklist (id, username, reason) VALUES (?, ?, ?)', [user.id, user.username, reason], (err) => {
@@ -667,7 +673,6 @@ async function unblacklistUser(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may modify the restriction list.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const user = interaction.options.getUser('user');
   db.run('DELETE FROM blacklist WHERE id = ?', [user.id], (err) => {
     if (err) {
@@ -686,7 +691,6 @@ async function resetAll(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reset tournament data.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   db.run('DELETE FROM matches');
   db.run('UPDATE players SET mmr_data = \'{}\'');
   logAction(interaction.user.id, interaction.user.username, 'RESET_ALL', 'All tournament data reset');
@@ -699,13 +703,11 @@ async function undoLastMatch(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reverse match results.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   db.get('SELECT * FROM matches WHERE approved = 1 ORDER BY id DESC LIMIT 1', [], (err, match) => {
     if (err || !match || !match.winner_mmr_before || !match.loser_mmr_before) {
       const embed = createErrorEmbed('No Undoable Match', 'No approved matches available to reverse.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
-
     try {
       const winnerBefore = JSON.parse(match.winner_mmr_before);
       const loserBefore = JSON.parse(match.loser_mmr_before);
@@ -758,8 +760,36 @@ async function checkMMR(interaction) {
     });
 }
 
+// UPDATED: showLeaderboard includes laddermate
 async function showLeaderboard(interaction) {
   const mode = interaction.options.getString('mode') || '1v1';
+
+  if (mode === 'laddermate') {
+    const lastUpdatedISO = await getMetadata('laddermate_last_updated', null);
+    let description = 'View the official **Laddermate** rankings for our community league:\n\n' +
+                      '[👉 Open Laddermate Ladder](https://www.laddermate.app/ladder/leagues/d235a092-c3be-4912-b204-ce610c282082)\n\n' +
+                      'This ladder is managed externally. Your in-bot ELO does not affect it.';
+
+    let footerText = 'Laddermate integration – external leaderboard';
+
+    if (lastUpdatedISO) {
+      const timestamp = Math.floor(new Date(lastUpdatedISO).getTime() / 1000);
+      description += `\n🕗 Last synced: <t:${timestamp}:R>`;
+      footerText += ` • Updated <t:${timestamp}:R>`;
+    } else {
+      description += '\n🕗 Last synced: *Never*';
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x8e44ad)
+      .setTitle('🏆 Laddermate Leaderboard')
+      .setDescription(description)
+      .setThumbnail('https://www.laddermate.app/favicon.ico')
+      .setFooter({ text: footerText });
+
+    return interaction.reply({ embeds: [embed] });
+  }
+
   if (!MODES.includes(mode)) {
     const embed = createErrorEmbed('Invalid Mode', `Available modes: ${MODES.join(', ')}`);
     return interaction.reply({ embeds: [embed], ephemeral: true });
@@ -770,7 +800,6 @@ async function showLeaderboard(interaction) {
       const embed = createInfoEmbed('No Players', 'No participants found.');
       return interaction.reply({ embeds: [embed] });
     }
-
     const players = rows.map(row => {
       try {
         const mmrData = JSON.parse(row.mmr_data);
@@ -791,20 +820,37 @@ async function showLeaderboard(interaction) {
   });
 }
 
+// NEW: /laddermate-update command
+async function handleLaddermateUpdate(interaction) {
+  if (interaction.user.id !== BOT_OWNER_ID) {
+    return interaction.reply({ embeds: [createErrorEmbed('Unauthorized', 'Only the bot owner can use this command.')], ephemeral: true });
+  }
+
+  const now = new Date().toISOString();
+  await setMetadata('laddermate_last_updated', now);
+
+  const timestamp = Math.floor(new Date(now).getTime() / 1000);
+  const embed = createSuccessEmbed(
+    '✅ Laddermate Timestamp Updated',
+    `Last updated: <t:${timestamp}:R>\n(Stored as ISO: ${now})`
+  );
+  interaction.reply({ embeds: [embed] });
+}
+
 async function showHelp(interaction) {
   const isMod = await isAuthorized(interaction.user.id);
   let description = "🔹 **PLAYER COMMANDS**\n/register      — Enroll\n/submit_match  — Report result\n/elo           — View ratings & rank\n/leaderboard   — View rankings\n/match_log     — View full match history\n/tournaments   — View tournaments\n/profile        — View your profile\n";
-
   if (isMod) {
     description += "🔸 **MODERATOR COMMANDS**\n/pending         — Review submissions\n/approve_match   — Confirm result\n/approve_all     — Approve all pending\n/add_verifier    — Grant rights\n/remove_verifier — Revoke rights\n/blacklist       — Restrict user\n/unblacklist     — Lift restriction\n/reset_all       — Reset system (OWNER)\n/undo_last       — Reverse match (OWNER)\n/logs            — View action logs (OWNER/MOD)\n";
   }
-
+  if (interaction.user.id === BOT_OWNER_ID) {
+    description += "👑 **OWNER ONLY**\n/laddermate-update — Update Laddermate sync timestamp\n";
+  }
   const embed = new EmbedBuilder()
     .setColor(0x3498db)
     .setTitle('📋 TOURNAMENT SYSTEM HELP')
     .setDescription(description)
     .setFooter({ text: 'Use /tournament_types to see formats' });
-
   interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
@@ -820,7 +866,6 @@ async function showMatchLog(interaction) {
       const embed = createInfoEmbed('📜 Match Log', `${target.username} has no recorded matches.`);
       return interaction.reply({ embeds: [embed] });
     }
-
     let description = '';
     rows.reverse().forEach(row => {
       const winners = JSON.parse(row.winner_team);
@@ -834,13 +879,11 @@ async function showMatchLog(interaction) {
       const date = new Date(row.timestamp).toLocaleDateString();
       description += `**#${row.id}** • [${row.mode}] vs ${opponent} • ${status} (${change}) • ${date}\n`;
     });
-
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle(`📜 ${target.username}'s Match Log`)
       .setDescription(description)
       .setFooter({ text: 'Last 15 matches' });
-
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -852,7 +895,6 @@ async function showMatchHistory(interaction) {
       const embed = createInfoEmbed('No Match History', `${target.username} has no recorded matches.`);
       return interaction.reply({ embeds: [embed] });
     }
-
     let description = '';
     rows.forEach((row, index) => {
       const winners = JSON.parse(row.winner_team);
@@ -862,13 +904,11 @@ async function showMatchHistory(interaction) {
       const opponent = isWinner ? losers.map(id => `<@${id}>`).join(', ') : winners.map(id => `<@${id}>`).join(', ');
       description += `**${index + 1}.** [${row.mode}] vs ${opponent} • ${status}\n`;
     });
-
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle(`📊 ${target.username}'s Match History`)
       .setDescription(description)
       .setFooter({ text: 'Latest 10 matches' });
-
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -938,7 +978,6 @@ async function showProfile(interaction) {
     .setTitle(`🏅 ${target.username}'s Profile`)
     .setDescription(description)
     .setFooter({ text: 'Use /manage_title to equip a title' });
-
   interaction.reply({ embeds: [embed] });
 }
 
@@ -947,7 +986,6 @@ async function addTournamentHost(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can assign tournament hosts.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const user = interaction.options.getUser('user');
   db.run('INSERT OR IGNORE INTO tournament_hosts (id, username) VALUES (?, ?)', [user.id, user.username], (err) => {
     if (err) {
@@ -966,7 +1004,6 @@ async function removeTournamentHost(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can remove tournament hosts.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const user = interaction.options.getUser('user');
   db.run('DELETE FROM tournament_hosts WHERE id = ?', [user.id], (err) => {
     if (err) {
@@ -993,7 +1030,6 @@ async function createTournament(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'You must be a tournament host to create tournaments.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const name = interaction.options.getString('name');
   const mode = interaction.options.getString('mode');
   const type = interaction.options.getString('type');
@@ -1027,11 +1063,9 @@ async function createTournament(interaction) {
         const embed = createErrorEmbed('Creation Failed', 'Please try again later.');
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
-
       const tournamentId = this.lastID;
       const tournamentInfo = TOURNAMENT_TYPES[type];
       let description = `**📋 Format:** ${tournamentInfo.name}\n**🎮 Mode:** ${mode}\n**🆔 ID:** ${tournamentId}\n`;
-
       if (type === 'best_of_series') description += `**🎯 Best-of:** ${bestOf}\n`;
       if (totalRounds > 0) description += `**🔄 Total Rounds:** ${totalRounds}\n`;
       description += `**📅 Start Date:** ${startDate || 'Not set'}\n*${tournamentInfo.description}*`;
@@ -1059,30 +1093,25 @@ async function createTournament(interaction) {
 async function joinTournament(interaction) {
   const tournamentId = interaction.options.getInteger('id');
   const player = await ensurePlayer(interaction.user.id, interaction.user.username);
-
   db.get('SELECT * FROM tournaments WHERE id = ?', [tournamentId], async (err, tourney) => {
     if (err || !tourney) {
       const embed = createErrorEmbed('Tournament Not Found', 'The tournament ID is invalid.');
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
-
     const playerMMR = player.mmr_data[tourney.mode] || 100;
     if (playerMMR < tourney.min_mmr || playerMMR > tourney.max_mmr) {
       const embed = createErrorEmbed('ELO Requirements Not Met', `Your ELO (${playerMMR}) doesn't meet requirements (${tourney.min_mmr}-${tourney.max_mmr}).`);
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
-
     db.run(`INSERT OR IGNORE INTO tournament_participants (tournament_id, player_id) VALUES (?, ?)`, [tournamentId, interaction.user.id], async (err) => {
       if (err) {
         const embed = createErrorEmbed('Failed to Join', 'Please try again later.');
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
-
       const roleName = `Tournament-${tournamentId}`;
       const roleAssigned = await assignTournamentRole(interaction.guild, interaction.user.id, roleName);
       let response = `✅ Successfully joined tournament "${tourney.name}"!`;
       if (roleAssigned) response += `\n🎭 Assigned role: ${roleName}`;
-
       logAction(interaction.user.id, interaction.user.username, 'JOIN_TOURNAMENT', `Tournament ID: ${tournamentId}, Name: ${tourney.name}`);
       const embed = createSuccessEmbed('Tournament Joined', response);
       await interaction.reply({ embeds: [embed] });
@@ -1095,13 +1124,11 @@ async function showTournaments(interaction) {
   let query = 'SELECT * FROM tournaments';
   if (status !== 'all') query += ` WHERE status = '${status}'`;
   query += ' ORDER BY start_date ASC LIMIT 10';
-
   db.all(query, [], (err, tournaments) => {
     if (err || tournaments.length === 0) {
       const embed = createInfoEmbed('No Tournaments', 'No tournaments found.');
       return interaction.reply({ embeds: [embed] });
     }
-
     let description = "";
     tournaments.forEach(t => {
       const date = t.start_date || 'TBD';
@@ -1112,12 +1139,10 @@ async function showTournaments(interaction) {
       if (t.mmr_range > 0) description += ` (±${t.mmr_range})`;
       description += `\nDate: ${date}\n\n`;
     });
-
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle('🏆 Tournaments')
       .setDescription(description);
-
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -1127,14 +1152,11 @@ async function awardTitle(interaction) {
     const embed = createErrorEmbed('Permission Denied', 'Only tournament hosts can award titles.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   const tournamentId = interaction.options.getInteger('tournament_id');
   const winner = interaction.options.getUser('winner');
   const title = interaction.options.getString('title');
-
   db.run(`INSERT INTO player_titles (player_id, title, tournament_id, awarded_by) VALUES (?, ?, ?, ?)`, [winner.id, title, tournamentId, interaction.user.id]);
   db.run(`UPDATE players SET equipped_title = CASE WHEN equipped_title = '' THEN ? ELSE equipped_title END WHERE id = ?`, [title, winner.id]);
-
   logAction(interaction.user.id, interaction.user.username, 'AWARD_TITLE', `Title: "${title}", Winner: ${winner.username} (${winner.id}), Tournament ID: ${tournamentId}`);
   const embed = createSuccessEmbed('Title Awarded', `🏆 Title "${title}" awarded to <@${winner.id}>!`);
   interaction.reply({ embeds: [embed] });
@@ -1143,7 +1165,6 @@ async function awardTitle(interaction) {
 async function manageTitle(interaction) {
   const action = interaction.options.getString('action');
   const title = interaction.options.getString('title');
-
   if (action === 'equip') {
     db.get('SELECT 1 FROM player_titles WHERE player_id = ? AND title = ?', [interaction.user.id, title], (err, row) => {
       if (!row) {
@@ -1170,7 +1191,6 @@ async function showTournamentTypes(interaction) {
     .setTitle('🏆 Tournament Formats')
     .setDescription('Use `/create_tournament type:[type]` to create a tournament')
     .addFields({ name: 'Quick Reference', value: 'React with 📋 for full descriptions' });
-
   await interaction.reply({ embeds: [overviewEmbed] });
 
   const detailedEmbeds = [];
@@ -1196,26 +1216,22 @@ async function showLogs(interaction) {
     const embed = createErrorEmbed('Access Denied', 'Only owners and verifiers can view logs.');
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
-
   db.all('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 20', [], (err, rows) => {
     if (err || rows.length === 0) {
       const embed = createInfoEmbed('No Logs', 'No actions have been recorded yet.');
       return interaction.reply({ embeds: [embed] });
     }
-
     let description = '';
     rows.forEach(row => {
       const time = new Date(row.timestamp).toLocaleString();
       description += `[${time}] **${row.username}**: ${row.action}\n`;
       if (row.details) description += `> ${row.details}\n`;
     });
-
     const embed = new EmbedBuilder()
       .setColor(0x9b59b6)
       .setTitle('📋 Action Logs')
       .setDescription(description)
       .setFooter({ text: 'Last 20 actions' });
-
     interaction.reply({ embeds: [embed] });
   });
 }
@@ -1234,7 +1250,7 @@ const commands = [
     .addUserOption(o => o.setName('loser2').setDescription('Loser 2 (2v2 only)')),
   new SlashCommandBuilder().setName('pending').setDescription('View pending submissions'),
   new SlashCommandBuilder().setName('approve_match').setDescription('Approve a submission').addIntegerOption(o => o.setName('id').setDescription('Submission ID').setRequired(true)),
-  new SlashCommandBuilder().setName('approve_all').setDescription('Approve all pending submissions'), // NEW
+  new SlashCommandBuilder().setName('approve_all').setDescription('Approve all pending submissions'),
   new SlashCommandBuilder().setName('add_verifier').setDescription('Add a verifier').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
   new SlashCommandBuilder().setName('remove_verifier').setDescription('Remove a verifier').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
   new SlashCommandBuilder().setName('blacklist').setDescription('Ban a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason')),
@@ -1242,11 +1258,16 @@ const commands = [
   new SlashCommandBuilder().setName('reset_all').setDescription('Reset all data'),
   new SlashCommandBuilder().setName('undo_last').setDescription('Undo last match'),
   new SlashCommandBuilder().setName('elo').setDescription('Check ELO & rank').addUserOption(o => o.setName('user').setDescription('User')),
-  new SlashCommandBuilder().setName('leaderboard').setDescription('View leaderboard').addStringOption(o => o.setName('mode').setDescription('Game mode').addChoices(MODES.map(m => ({ name: m, value: m })))),
+  new SlashCommandBuilder().setName('leaderboard').setDescription('View leaderboard')
+    .addStringOption(o => o.setName('mode').setDescription('Game mode').addChoices([
+      { name: '1v1', value: '1v1' },
+      { name: '2v2', value: '2v2' },
+      { name: 'Laddermate (External)', value: 'laddermate' }
+    ])),
   new SlashCommandBuilder().setName('help').setDescription('Show help guide'),
   new SlashCommandBuilder().setName('match_log').setDescription('View detailed match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
   new SlashCommandBuilder().setName('match_history').setDescription('View match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
-  new SlashCommandBuilder().setName('profile').setDescription('View your profile').addUserOption(o => o.setName('user').setDescription('Player to check')), // NEW
+  new SlashCommandBuilder().setName('profile').setDescription('View your profile').addUserOption(o => o.setName('user').setDescription('Player to check')),
   new SlashCommandBuilder().setName('add_tournament_host').setDescription('Add tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to promote').setRequired(true)),
   new SlashCommandBuilder().setName('remove_tournament_host').setDescription('Remove tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to demote').setRequired(true)),
   new SlashCommandBuilder().setName('create_tournament').setDescription('Create a tournament (hosts only)')
@@ -1270,7 +1291,8 @@ const commands = [
     .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true).addChoices([{ name: 'Equip', value: 'equip' }, { name: 'Unequip', value: 'unequip' }]))
     .addStringOption(o => o.setName('title').setDescription('Title to equip')),
   new SlashCommandBuilder().setName('tournament_types').setDescription('View all available tournament formats'),
-  new SlashCommandBuilder().setName('logs').setDescription('View action logs (owners/verifiers only)')
+  new SlashCommandBuilder().setName('logs').setDescription('View action logs (owners/verifiers only)'),
+  new SlashCommandBuilder().setName('laddermate-update').setDescription('✅ [OWNER] Update Laddermate last-sync timestamp') // NEW
 ].map(cmd => cmd.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -1297,6 +1319,36 @@ const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
   }
 })();
 
+const commandHandlers = {
+  'register': registerPlayer,
+  'submit_match': submitMatch,
+  'pending': listPending,
+  'approve_match': approveMatch,
+  'approve_all': approveAllMatches,
+  'add_verifier': addVerifier,
+  'remove_verifier': removeVerifier,
+  'blacklist': blacklistUser,
+  'unblacklist': unblacklistUser,
+  'reset_all': resetAll,
+  'undo_last': undoLastMatch,
+  'elo': checkMMR,
+  'leaderboard': showLeaderboard,
+  'help': showHelp,
+  'match_log': showMatchLog,
+  'match_history': showMatchHistory,
+  'profile': showProfile,
+  'add_tournament_host': addTournamentHost,
+  'remove_tournament_host': removeTournamentHost,
+  'create_tournament': createTournament,
+  'join_tournament': joinTournament,
+  'tournaments': showTournaments,
+  'award_title': awardTitle,
+  'manage_title': manageTitle,
+  'tournament_types': showTournamentTypes,
+  'logs': showLogs,
+  'laddermate-update': handleLaddermateUpdate // NEW
+};
+
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const { commandName } = interaction;
@@ -1304,7 +1356,7 @@ client.on('interactionCreate', async interaction => {
   const SLOW_COMMANDS = [
     'submit_match', 'approve_match', 'approve_all', 'create_tournament', 'join_tournament',
     'reset_all', 'undo_last', 'add_verifier', 'remove_verifier',
-    'blacklist', 'unblacklist', 'award_title'
+    'blacklist', 'unblacklist', 'award_title', 'laddermate-update'
   ];
 
   if (SLOW_COMMANDS.includes(commandName)) {
@@ -1312,33 +1364,10 @@ client.on('interactionCreate', async interaction => {
   }
 
   try {
-    if (commandName === 'register') await registerPlayer(interaction);
-    else if (commandName === 'submit_match') await submitMatch(interaction);
-    else if (commandName === 'pending') await listPending(interaction);
-    else if (commandName === 'approve_match') await approveMatch(interaction);
-    else if (commandName === 'approve_all') await approveAllMatches(interaction); // NEW
-    else if (commandName === 'add_verifier') await addVerifier(interaction);
-    else if (commandName === 'remove_verifier') await removeVerifier(interaction);
-    else if (commandName === 'blacklist') await blacklistUser(interaction);
-    else if (commandName === 'unblacklist') await unblacklistUser(interaction);
-    else if (commandName === 'reset_all') await resetAll(interaction);
-    else if (commandName === 'undo_last') await undoLastMatch(interaction);
-    else if (commandName === 'elo') await checkMMR(interaction);
-    else if (commandName === 'leaderboard') await showLeaderboard(interaction);
-    else if (commandName === 'help') await showHelp(interaction);
-    else if (commandName === 'match_log') await showMatchLog(interaction);
-    else if (commandName === 'match_history') await showMatchHistory(interaction);
-    else if (commandName === 'profile') await showProfile(interaction); // NEW
-    else if (commandName === 'add_tournament_host') await addTournamentHost(interaction);
-    else if (commandName === 'remove_tournament_host') await removeTournamentHost(interaction);
-    else if (commandName === 'create_tournament') await createTournament(interaction);
-    else if (commandName === 'join_tournament') await joinTournament(interaction);
-    else if (commandName === 'tournaments') await showTournaments(interaction);
-    else if (commandName === 'award_title') await awardTitle(interaction);
-    else if (commandName === 'manage_title') await manageTitle(interaction);
-    else if (commandName === 'tournament_types') await showTournamentTypes(interaction);
-    else if (commandName === 'logs') await showLogs(interaction);
-    else {
+    const handler = commandHandlers[commandName];
+    if (handler) {
+      await handler(interaction);
+    } else {
       const embed = createErrorEmbed('Unknown Command', 'This command is not recognized.');
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp({ embeds: [embed], ephemeral: true });
