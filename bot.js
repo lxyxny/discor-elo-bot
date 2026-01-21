@@ -767,7 +767,7 @@ async function showLeaderboard(interaction) {
   if (mode === 'laddermate') {
     const lastUpdatedISO = await getMetadata('laddermate_last_updated', null);
     let description = 'View the official **Laddermate** rankings for our community league:\n\n' +
-                      '[👉 Open Laddermate Ladder](https://www.laddermate.app/ladder/leagues/d235a092-c3be-4912-b204-ce610c282082)\n\n' +
+                      '[👉 Open Laddermate Ladder](https://www.laddermate.app/ladder/leagues/d235a092-c3be-4912-b204-ce610c282082/players)\n\n' +
                       'This ladder is managed externally. Your in-bot ELO does not affect it.';
 
     let footerText = 'Laddermate integration – external leaderboard';
