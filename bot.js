@@ -40,6 +40,7 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS tournament_matches (id INTEGER PRIMARY KEY AUTOINCREMENT, tournament_id INTEGER, match_id INTEGER, round INTEGER, match_type TEXT, player1_id TEXT, player2_id TEXT, winner_id TEXT, games_won_p1 INTEGER DEFAULT 0, games_won_p2 INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', bracket_position TEXT, FOREIGN KEY (tournament_id) REFERENCES tournaments(id))`);
   db.run(`CREATE TABLE IF NOT EXISTS player_titles (player_id TEXT, title TEXT, tournament_id INTEGER, awarded_by TEXT, awarded_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (player_id) REFERENCES players(id), FOREIGN KEY (tournament_id) REFERENCES tournaments(id))`);
   db.run(`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, username TEXT, action TEXT, details TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+  // New metadata table for laddermate timestamp
   db.run(`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)`);
 });
 
@@ -351,71 +352,68 @@ async function registerPlayer(interaction) {
 // NEW: Register All Command
 async function registerAllMembers(interaction) {
   if (interaction.user.id !== BOT_OWNER_ID) {
-    const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can use this command.');
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ 
+      embeds: [createErrorEmbed('Permission Denied', 'Only the bot owner can use this command.')], 
+      ephemeral: true 
+    });
   }
 
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    // Fetch all members from the guild
+    // Fetch ALL members (requires GuildMembers intent)
     await interaction.guild.members.fetch();
-    const members = interaction.guild.members.cache;
-    
-    let registeredCount = 0;
-    let skippedCount = 0;
-    let blacklistedCount = 0;
-    const batchSize = 50;
-    const membersArray = Array.from(members.values()).filter(m => !m.user.bot && m.user.id !== client.user.id);
+    const members = interaction.guild.members.cache.filter(m => !m.user.bot && m.user.id !== client.user.id);
 
-    // Check blacklist once for efficiency
-    const blacklistedIds = await new Promise((resolve) => {
-      db.all('SELECT id FROM blacklist', [], (err, rows) => {
-        resolve(err ? [] : rows.map(r => r.id));
-      });
+    // Get blacklisted IDs once
+    const blacklisted = await new Promise((resolve) => {
+      db.all('SELECT id FROM blacklist', [], (err, rows) => 
+        resolve(err ? [] : rows.map(r => r.id))
+      );
     });
 
-    // Process in batches to avoid timeouts and respect rate limits
-    for (let i = 0; i < membersArray.length; i += batchSize) {
-      const batch = membersArray.slice(i, i + batchSize);
+    let registered = 0;
+    let skipped = 0;
+    const batchSize = 25; // Smaller batch for safety
+    const memberArray = Array.from(members.values());
+
+    // Process in batches
+    for (let i = 0; i < memberArray.length; i += batchSize) {
+      const batch = memberArray.slice(i, i + batchSize);
       
       for (const member of batch) {
-        // Skip blacklisted users
-        if (blacklistedIds.includes(member.user.id)) {
-          blacklistedCount++;
-          skippedCount++;
+        if (blacklisted.includes(member.user.id)) {
+          skipped++;
           continue;
         }
 
         // Check if already registered
-        const existing = await new Promise((resolve) => {
-          db.get('SELECT 1 FROM players WHERE id = ?', [member.user.id], (err) => {
-            if (err) resolve(false);
-            else resolve(true);
-          });
+        const exists = await new Promise((resolve) => {
+          db.get('SELECT 1 FROM players WHERE id = ?', [member.user.id], (err) => 
+            resolve(!err)
+          );
         });
 
-        if (existing) {
-          skippedCount++;
+        if (exists) {
+          skipped++;
           continue;
         }
 
-        // Register the player with default MMR
-        const defaultMMR = JSON.stringify(getDefaultMMRData());
+        // Register player
         await new Promise((resolve, reject) => {
           db.run(
-            'INSERT INTO players (id, username, mmr_data) VALUES (?, ?, ?)', 
-            [member.user.id, member.user.username, defaultMMR],
+            'INSERT INTO players (id, username, mmr_data) VALUES (?, ?, ?)',
+            [member.user.id, member.user.username, JSON.stringify(getDefaultMMRData())],
             (err) => err ? reject(err) : resolve()
           );
         });
 
-        registeredCount++;
+        registered++;
       }
 
-      // Brief pause between batches to avoid overwhelming the database
-      if (i + batchSize < membersArray.length) {
-        await new Promise(resolve => setTimeout(resolve, 50));
+      // Small delay between batches to avoid overwhelming DB
+      if (i + batchSize < memberArray.length) {
+        await new Promise(r => setTimeout(r, 30));
       }
     }
 
@@ -423,31 +421,25 @@ async function registerAllMembers(interaction) {
       interaction.user.id, 
       interaction.user.username, 
       'REGISTER_ALL', 
-      `Registered ${registeredCount} members, skipped ${skippedCount} (already registered/bots/blacklisted)`
+      `Registered ${registered}, skipped ${skipped} (bots/blacklisted/already registered)`
     );
 
-    const embed = new EmbedBuilder()
-      .setColor(0x2ecc71)
-      .setTitle('✅ Bulk Registration Complete')
-      .setDescription(
-        `**Server Members:** ${membersArray.length + blacklistedCount + 1} (including bots)
-**Newly Registered:** ${registeredCount}
-**Skipped:** ${skippedCount}
-${blacklistedCount > 0 ? `**Blacklisted:** ${blacklistedCount}\n` : ''}
-All registered players start with **100 ELO** in all modes.`
-      )
-      .setTimestamp()
-      .setFooter({ text: 'Tournament System' });
-
-    await interaction.followUp({ embeds: [embed] });
+    await interaction.followUp({
+      embeds: [createSuccessEmbed(
+        '✅ Bulk Registration Complete',
+        `**Registered:** ${registered} members\n**Skipped:** ${skipped} members\nAll new players start at **100 ELO** in all modes.`
+      )]
+    });
 
   } catch (error) {
     console.error('Register all error:', error);
-    const embed = createErrorEmbed(
-      'Registration Failed',
-      `An error occurred: ${error.message || 'Unknown error'}\nCheck console logs for details.`
-    );
-    await interaction.followUp({ embeds: [embed] });
+    await interaction.followUp({
+      embeds: [createErrorEmbed(
+        'Registration Failed',
+        `Error: ${error.message || 'Unknown error'}\n\n💡 **Fix required:** Ensure bot has "Server Members Intent" enabled in Discord Developer Portal.`
+      )],
+      ephemeral: true
+    });
   }
 }
 
@@ -1474,7 +1466,7 @@ async function showLogs(interaction) {
 
 const commands = [
   new SlashCommandBuilder().setName('register').setDescription('Join the tournament system'),
-  new SlashCommandBuilder().setName('register_all').setDescription('✅ [OWNER] Register all server members to tournament system'),
+  new SlashCommandBuilder().setName('register_all').setDescription('✅ [OWNER] Register all server members'),
   new SlashCommandBuilder().setName('submit_match').setDescription('Report a match result')
     .addStringOption(o => o.setName('mode').setDescription('Game mode').setRequired(true).addChoices(MODES.map(m => ({ name: m, value: m }))))
     .addUserOption(o => o.setName('winner1').setDescription('Winner 1').setRequired(true))
@@ -1528,7 +1520,12 @@ const commands = [
   new SlashCommandBuilder().setName('laddermate-update').setDescription('✅ [OWNER] Update Laddermate last-sync timestamp')
 ].map(cmd => cmd.toJSON());
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ 
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers  // REQUIRED for /register_all to work
+  ] 
+});
 
 client.once('ready', async () => {
   console.log('✅ Bot is ready!');
