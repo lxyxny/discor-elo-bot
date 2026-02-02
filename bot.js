@@ -164,6 +164,8 @@ async function assignTournamentRole(guild, userId, roleName) {
   }
 }
 
+
+
 async function removeTournamentRole(guild, userId, roleName) {
   try {
     const member = await guild.members.fetch(userId);
@@ -757,6 +759,150 @@ async function approveMatch(interaction) {
       await interaction.reply({ embeds: [embed] });
     });
   });
+}
+
+// ===== TIMEZONE GROUPING HELPER =====
+async function groupTimezones(guild) {
+    // Fetch all members (requires GuildMembers intent)
+    await guild.members.fetch();
+    
+    // Pattern to match timezone roles: UTC±X or UTC±XX (including UTC+0/UTC-0)
+    const tzPattern = /UTC([+-])(\d{1,2})/i;
+    
+    // Map: offset -> array of member display names
+    const membersByOffset = new Map();
+    
+    // Collect members with timezone roles
+    guild.members.cache.forEach(member => {
+        if (member.user.bot) return;
+        
+        member.roles.cache.forEach(role => {
+            const match = role.name.match(tzPattern);
+            if (match) {
+                const sign = match[1] === '-' ? -1 : 1;
+                const hours = parseInt(match[2], 10);
+                const offset = sign * hours;
+                
+                if (!membersByOffset.has(offset)) {
+                    membersByOffset.set(offset, []);
+                }
+                membersByOffset.get(offset).push(member.displayName || member.user.username);
+            }
+        });
+    });
+    
+    // Convert to sorted array of [offset, members[]]
+    const offsets = Array.from(membersByOffset.entries())
+        .filter(([_, members]) => members.length > 0)
+        .sort((a, b) => a[0] - b[0]);
+    
+    if (offsets.length === 0) {
+        return { groups: [], totalMembers: 0 };
+    }
+    
+    // Create groups with max 3-hour range (e.g., -2 to +1 = 3 hour difference)
+    const groups = [];
+    let currentGroup = {
+        minOffset: offsets[0][0],
+        maxOffset: offsets[0][0],
+        offsets: [offsets[0]],
+        members: [...offsets[0][1]]
+    };
+    
+    for (let i = 1; i < offsets.length; i++) {
+        const [offset, members] = offsets[i];
+        const wouldExceedRange = offset - currentGroup.minOffset > 3;
+        
+        if (wouldExceedRange) {
+            // Finalize current group
+            groups.push(currentGroup);
+            
+            // Start new group
+            currentGroup = {
+                minOffset: offset,
+                maxOffset: offset,
+                offsets: [[offset, members]],
+                members: [...members]
+            };
+        } else {
+            // Add to current group
+            currentGroup.maxOffset = offset;
+            currentGroup.offsets.push([offset, members]);
+            currentGroup.members.push(...members);
+        }
+    }
+    
+    // Add final group
+    groups.push(currentGroup);
+    
+    return {
+        groups,
+        totalMembers: [...membersByOffset.values()].flat().length
+    };
+}
+
+// ===== COMMAND HANDLER =====
+async function groupZonesCommand(interaction) {
+    await interaction.deferReply();
+    
+    try {
+        const { groups, totalMembers } = await groupTimezones(interaction.guild);
+        
+        if (totalMembers === 0) {
+            const embed = createErrorEmbed(
+                'No Timezone Roles Found',
+                'No members have timezone roles (UTC±X format) assigned.\n' +
+                'Assign roles like `UTC-5`, `UTC+0`, or `UTC+9` to enable grouping.'
+            );
+            return interaction.editReply({ embeds: [embed] });
+        }
+        
+        // Build embed description
+        let description = `👥 **${totalMembers}** members grouped into **${groups.length}** timezone clusters\n`;
+        description += `📏 Max range per group: **3 hours**\n\n`;
+        
+        groups.forEach((group, index) => {
+            const min = group.minOffset >= 0 ? `+${group.minOffset}` : group.minOffset;
+            const max = group.maxOffset >= 0 ? `+${group.maxOffset}` : group.maxOffset;
+            const range = group.maxOffset - group.minOffset;
+            
+            description += `**Group ${index + 1}** (${group.members.length} members)\n`;
+            description += `🕗 UTC${min} to UTC${max} (range: ${range}h)\n`;
+            
+            // Show up to 10 example members per group
+            const examples = group.members.slice(0, 10);
+            description += `👤 ${examples.join(', ')}${group.members.length > 10 ? ` (+${group.members.length - 10} more)` : ''}\n\n`;
+        });
+        
+        const embed = new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle('🌍 Timezone Groups')
+            .setDescription(description)
+            .setFooter({ 
+                text: `Total members with timezone roles: ${totalMembers} • Groups: ${groups.length}`,
+                iconURL: interaction.guild.iconURL() || undefined
+            })
+            .setTimestamp();
+        
+        await interaction.editReply({ embeds: [embed] });
+        
+        // Log action
+        logAction(
+            interaction.user.id,
+            interaction.user.username,
+            'GROUPZONES',
+            `Generated ${groups.length} timezone groups for ${totalMembers} members`
+        );
+        
+    } catch (error) {
+        console.error('Groupzones error:', error);
+        const embed = createErrorEmbed(
+            'Grouping Failed',
+            'An error occurred while grouping timezones.\n' +
+            '💡 Ensure bot has "Server Members Intent" enabled in Discord Developer Portal.'
+        );
+        await interaction.editReply({ embeds: [embed] });
+    }
 }
 
 // FIXED: add_verifier now updates username if exists
@@ -1490,6 +1636,7 @@ const commands = [
       { name: 'Laddermate (External)', value: 'laddermate' }
     ])),
   new SlashCommandBuilder().setName('help').setDescription('Show help guide'),
+  new SlashCommandBuilder().setName('groupzones').setDescription('Group members by timezone roles (UTC±X) with 3-hour max range'),
   new SlashCommandBuilder().setName('match_log').setDescription('View detailed match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
   new SlashCommandBuilder().setName('match_history').setDescription('View match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
   new SlashCommandBuilder().setName('profile').setDescription('View your profile').addUserOption(o => o.setName('user').setDescription('Player to check')),
@@ -1566,6 +1713,7 @@ const commandHandlers = {
   'elo': checkMMR,
   'leaderboard': showLeaderboard,
   'help': showHelp,
+  'groupzones': groupZonesCommand,
   'match_log': showMatchLog,
   'match_history': showMatchHistory,
   'profile': showProfile,
