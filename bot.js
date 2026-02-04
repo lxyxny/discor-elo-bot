@@ -1738,13 +1738,13 @@ client.on('interactionCreate', async interaction => {
     
     const { commandName } = interaction;
     
-    const SLOW_COMMANDS = [
+    const AUTO_DEFER_COMMANDS = new Set([
         'submit_match', 'approve_match', 'approve_all', 'create_tournament', 'join_tournament',
         'reset_all', 'undo_last', 'add_verifier', 'remove_verifier',
-        'blacklist', 'unblacklist', 'award_title', 'register_all', 'laddermate-update', 'groupzones'
-    ];
+        'blacklist', 'unblacklist', 'award_title', 'laddermate-update'
+    ]);
     
-    if (SLOW_COMMANDS.includes(commandName)) {
+    if (AUTO_DEFER_COMMANDS.has(commandName) && !interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: false });
     }
     
