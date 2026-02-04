@@ -46,6 +46,17 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)`);
 });
 
+function checkpointAndCloseDatabase() {
+    db.serialize(() => {
+        db.run('PRAGMA wal_checkpoint(FULL);');
+        db.close();
+    });
+}
+
+process.on('SIGINT', checkpointAndCloseDatabase);
+process.on('SIGTERM', checkpointAndCloseDatabase);
+process.on('beforeExit', checkpointAndCloseDatabase);
+
 // ===== Metadata Helpers =====
 function setMetadata(key, value) {
     return new Promise((resolve, reject) => {
@@ -287,6 +298,13 @@ function calculateMMRChange(winnerMMR, loserMMR) {
 
 function logAction(userId, username, action, details = '') {
     db.run('INSERT INTO logs (user_id, username, action, details) VALUES (?, ?, ?, ?)', [userId, username, action, details]);
+}
+
+function respondToInteraction(interaction, payload) {
+    if (interaction.deferred || interaction.replied) {
+        return interaction.editReply(payload);
+    }
+    return interaction.reply(payload);
 }
 
 function createSuccessEmbed(title, description) {
@@ -841,18 +859,18 @@ async function approveMatch(interaction) {
 async function addVerifier(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may assign verifier roles.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
     db.run('INSERT INTO verifiers (id, username) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username', [user.id, user.username], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to assign verifier role.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'ADD_VERIFIER', `User: ${user.username} (${user.id})`);
             const embed = createSuccessEmbed('Verifier Role Assigned', `✅ Verifier role assigned to <@${user.id}>.`);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -860,18 +878,18 @@ async function addVerifier(interaction) {
 async function removeVerifier(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may revoke verifier roles.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
     db.run('DELETE FROM verifiers WHERE id = ?', [user.id], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to revoke verifier role.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'REMOVE_VERIFIER', `User: ${user.username} (${user.id})`);
             const embed = createInfoEmbed('Verifier Role Removed', `🗑️ Verifier role removed from <@${user.id}>.`, 0xe74c3c);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -879,7 +897,7 @@ async function removeVerifier(interaction) {
 async function blacklistUser(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may manage the restriction list.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
@@ -887,11 +905,11 @@ async function blacklistUser(interaction) {
     db.run('INSERT OR REPLACE INTO blacklist (id, username, reason) VALUES (?, ?, ?)', [user.id, user.username, reason], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to restrict user.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'BLACKLIST', `User: ${user.username} (${user.id}), Reason: ${reason}`);
             const embed = createInfoEmbed('User Restricted', `🚫 User <@${user.id}> has been restricted.\nReason: ${reason}`, 0xe74c3c);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -899,18 +917,18 @@ async function blacklistUser(interaction) {
 async function unblacklistUser(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may modify the restriction list.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
     db.run('DELETE FROM blacklist WHERE id = ?', [user.id], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to lift restriction.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'UNBLACKLIST', `User: ${user.username} (${user.id})`);
             const embed = createSuccessEmbed('Restriction Lifted', `✅ Restriction lifted for <@${user.id}>.`);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -918,20 +936,20 @@ async function unblacklistUser(interaction) {
 async function resetAll(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reset tournament data.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     db.run('DELETE FROM matches');
     db.run('UPDATE players SET mmr_data = \'{}\'');
     logAction(interaction.user.id, interaction.user.username, 'RESET_ALL', 'All tournament data reset');
     const embed = createInfoEmbed('🚨 TOURNAMENT RESET INITIATED', 'All player ratings restored to default (100 ELO).', 0xe74c3c);
-    await interaction.reply({ embeds: [embed] });
+    await respondToInteraction(interaction, { embeds: [embed] });
 }
 
 async function undoLastMatch(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reverse match results.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     db.get('SELECT * FROM matches WHERE approved = 1 ORDER BY id DESC LIMIT 1', [], (err, match) => {
@@ -961,14 +979,14 @@ async function undoLastMatch(interaction) {
                 db.run('DELETE FROM matches WHERE id = ?', [match.id]);
                 logAction(interaction.user.id, interaction.user.username, 'UNDO_MATCH', `Match #${match.id}`);
                 const embed = createSuccessEmbed('Match Reversed', `↩️ Reversed **Match #${match.id}**. Ratings restored.`);
-                interaction.reply({ embeds: [embed] });
+                respondToInteraction(interaction, { embeds: [embed] });
             }).catch(() => {
                 const embed = createErrorEmbed('Undo Failed', 'Failed to restore player ratings.');
-                interaction.reply({ embeds: [embed], ephemeral: true });
+                respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
             });
         } catch (e) {
             const embed = createErrorEmbed('Undo Failed', 'An error occurred during reversal.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
     });
 }
@@ -1282,12 +1300,26 @@ async function removeTournamentHost(interaction) {
     });
 }
 
-// VALIDATE DATE FORMAT
-function isValidDate(dateStr) {
-    const regex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!regex.test(dateStr)) return false;
-    const d = new Date(dateStr);
-    return d.toISOString().slice(0, 10) === dateStr;
+function formatDateYYYYMMDD(date) {
+    return date.toISOString().slice(0, 10);
+}
+
+function getStartDateFromChoice(choice) {
+    const offsets = {
+        '1_day': 1,
+        '2_days': 2,
+        '3_days': 3,
+        '1_week': 7,
+        '2_weeks': 14,
+        '4_weeks': 28,
+        '1_month': 30,
+        '2_months': 60
+    };
+    const days = offsets[choice];
+    if (!days) return null;
+    const start = new Date();
+    start.setDate(start.getDate() + days);
+    return formatDateYYYYMMDD(start);
 }
 
 // FIXED: createTournament - Proper interaction handling
@@ -1297,13 +1329,14 @@ async function createTournament(interaction) {
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
     
-    const name = interaction.options.getString('name');
     const mode = interaction.options.getString('mode');
+    const name = interaction.options.getString('name');
     const type = interaction.options.getString('type');
     const minMMR = interaction.options.getInteger('min_mmr') || 0;
     const maxMMR = interaction.options.getInteger('max_mmr') || 5000;
     const mmrRange = interaction.options.getInteger('mmr_range') || 0;
-    const startDate = interaction.options.getString('start_date');
+    const startIn = interaction.options.getString('start_in');
+    const startDate = getStartDateFromChoice(startIn);
     const assignRole = interaction.options.getBoolean('assign_role') || false;
     const bestOf = interaction.options.getInteger('best_of') || 1;
     const totalRounds = interaction.options.getInteger('total_rounds') || 0;
@@ -1318,8 +1351,8 @@ async function createTournament(interaction) {
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
     
-    if (startDate && !isValidDate(startDate)) {
-        const embed = createErrorEmbed('Invalid Date', 'Start date must be in YYYY-MM-DD format.');
+    if (!startDate) {
+        const embed = createErrorEmbed('Invalid Start Time', 'Please choose a valid start delay.');
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
     
@@ -1441,7 +1474,7 @@ async function showTournaments(interaction) {
 async function awardTitle(interaction) {
     if (!(await isTournamentHost(interaction.user.id))) {
         const embed = createErrorEmbed('Permission Denied', 'Only tournament hosts can award titles.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const tournamentId = interaction.options.getInteger('tournament_id');
@@ -1453,7 +1486,7 @@ async function awardTitle(interaction) {
     
     logAction(interaction.user.id, interaction.user.username, 'AWARD_TITLE', `Title: "${title}", Winner: ${winner.username} (${winner.id}), Tournament ID: ${tournamentId}`);
     const embed = createSuccessEmbed('Title Awarded', `🏆 Title "${title}" awarded to <@${winner.id}>!`);
-    interaction.reply({ embeds: [embed] });
+    respondToInteraction(interaction, { embeds: [embed] });
 }
 
 async function manageTitle(interaction) {
@@ -1464,18 +1497,18 @@ async function manageTitle(interaction) {
         db.get('SELECT 1 FROM player_titles WHERE player_id = ? AND title = ?', [interaction.user.id, title], (err, row) => {
             if (!row) {
                 const embed = createErrorEmbed('Title Not Owned', 'You don\'t own this title.');
-                return interaction.reply({ embeds: [embed], ephemeral: true });
+                return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
             }
             db.run('UPDATE players SET equipped_title = ? WHERE id = ?', [title, interaction.user.id]);
             logAction(interaction.user.id, interaction.user.username, 'EQUIP_TITLE', `Title: "${title}"`);
             const embed = createSuccessEmbed('Title Equipped', `✨ Equipped title: "${title}"`);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         });
     } else {
         db.run('UPDATE players SET equipped_title = "" WHERE id = ?', [interaction.user.id]);
         logAction(interaction.user.id, interaction.user.username, 'UNEQUIP_TITLE', '');
         const embed = createSuccessEmbed('Title Unequipped', '✨ Unequipped title.');
-        interaction.reply({ embeds: [embed] });
+        respondToInteraction(interaction, { embeds: [embed] });
     }
 }
 
@@ -1646,13 +1679,22 @@ const commands = [
     new SlashCommandBuilder().setName('add_tournament_host').setDescription('Add tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to promote').setRequired(true)),
     new SlashCommandBuilder().setName('remove_tournament_host').setDescription('Remove tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to demote').setRequired(true)),
     new SlashCommandBuilder().setName('create_tournament').setDescription('Create a tournament (hosts only)')
-        .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
         .addStringOption(o => o.setName('mode').setDescription('Game mode').setRequired(true).addChoices(MODES.map(m => ({ name: m, value: m }))))
+        .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
+        .addStringOption(o => o.setName('start_in').setDescription('Start delay').setRequired(true).addChoices([
+            { name: '1 day', value: '1_day' },
+            { name: '2 days', value: '2_days' },
+            { name: '3 days', value: '3_days' },
+            { name: '1 week', value: '1_week' },
+            { name: '2 weeks', value: '2_weeks' },
+            { name: '4 weeks', value: '4_weeks' },
+            { name: '1 month', value: '1_month' },
+            { name: '2 months', value: '2_months' }
+        ]))
         .addStringOption(o => o.setName('type').setDescription('Tournament type').setRequired(true).addChoices(Object.entries(TOURNAMENT_TYPES).map(([value, type]) => ({ name: type.name, value }))))
         .addIntegerOption(o => o.setName('min_mmr').setDescription('Minimum ELO'))
         .addIntegerOption(o => o.setName('max_mmr').setDescription('Maximum ELO'))
         .addIntegerOption(o => o.setName('mmr_range').setDescription('ELO range'))
-        .addStringOption(o => o.setName('start_date').setDescription('Start date (YYYY-MM-DD)'))
         .addBooleanOption(o => o.setName('assign_role').setDescription('Create Discord role for participants'))
         .addIntegerOption(o => o.setName('best_of').setDescription('Best-of games (for series)'))
         .addIntegerOption(o => o.setName('total_rounds').setDescription('Total rounds (for Swiss/League)')),
@@ -1741,7 +1783,7 @@ client.on('interactionCreate', async interaction => {
     const AUTO_DEFER_COMMANDS = new Set([
         'submit_match', 'approve_match', 'approve_all', 'create_tournament', 'join_tournament',
         'reset_all', 'undo_last', 'add_verifier', 'remove_verifier',
-        'blacklist', 'unblacklist', 'award_title', 'laddermate-update'
+        'blacklist', 'unblacklist', 'award_title', 'laddermate-update', 'manage_title'
     ]);
     
     if (AUTO_DEFER_COMMANDS.has(commandName) && !interaction.deferred && !interaction.replied) {
