@@ -588,24 +588,63 @@ async function submitMatch(interaction) {
             loserPlayers.push(player);
         }
         
-        db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
-            [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
-            function (err) {
-                if (err) {
-                    return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-                }
-                
-                const matchNumber = this.lastID;
-                const wNames = winnerPlayers.map(p => p.username).join(', ');
-                const lNames = loserPlayers.map(p => p.username).join(', ');
-                
-                logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-                
-                const embed = createInfoEmbed('Submission Received',
-                    `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by a verifier.`, 0xf39c12);
-                
-                interaction.reply({ embeds: [embed] });
-            });
+        const isVerifier = await isAuthorized(interaction.user.id);
+        
+        if (isVerifier) {
+            const winnerMax = Math.max(...winnerPlayers.map(p => p.mmr_data[mode]));
+            const loserMax = Math.max(...loserPlayers.map(p => p.mmr_data[mode]));
+            const mmrChange = calculateMMRChange(winnerMax, loserMax);
+            const winnerMMRBefore = JSON.stringify(winnerPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
+            const loserMMRBefore = JSON.stringify(loserPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
+            
+            for (const player of winnerPlayers) {
+                const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] + mmrChange };
+                db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
+            }
+            
+            for (const player of loserPlayers) {
+                const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] - mmrChange };
+                db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
+            }
+            
+            db.run(`INSERT INTO matches (mode, winner_team, loser_team, winner_mmr_before, loser_mmr_before, mmr_change, approved, approved_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+                [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam), winnerMMRBefore, loserMMRBefore, mmrChange, interaction.user.id],
+                function (err) {
+                    if (err) {
+                        return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+                    }
+                    
+                    const matchNumber = this.lastID;
+                    const wNames = winnerPlayers.map(p => p.username).join(', ');
+                    const lNames = loserPlayers.map(p => p.username).join(', ');
+                    
+                    logAction(interaction.user.id, interaction.user.username, 'SUBMIT_MATCH', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
+                    
+                    const embed = createSuccessEmbed('Match Recorded',
+                        `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\n**ELO Change:** ±${mmrChange}`);
+                    
+                    interaction.reply({ embeds: [embed] });
+                });
+        } else {
+            db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
+                [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
+                function (err) {
+                    if (err) {
+                        return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+                    }
+                    
+                    const matchNumber = this.lastID;
+                    const wNames = winnerPlayers.map(p => p.username).join(', ');
+                    const lNames = loserPlayers.map(p => p.username).join(', ');
+                    
+                    logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
+                    
+                    const embed = createInfoEmbed('Match Submitted for Review',
+                        `**Match #${matchNumber}**\n**Submission ID:** ${matchNumber}\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by a verifier.`, 0xf39c12);
+                    
+                    interaction.reply({ embeds: [embed] });
+                });
+        }
     } catch (error) {
         console.error("Submit match error:", error);
         const embed = createErrorEmbed('Submission Failed', 'Ensure all players are registered with `/register`.');
@@ -641,8 +680,9 @@ async function listPending(interaction) {
 
 // NEW: Approve All Command
 async function approveAllMatches(interaction) {
-    if (interaction.user.id !== BOT_OWNER_ID) {
-        const embed = createErrorEmbed('Permission Denied', 'Only the system owner can approve all matches.');
+    const isAuth = await isAuthorized(interaction.user.id);
+    if (!isAuth) {
+        const embed = createErrorEmbed('Permission Denied', 'Only verifiers or the owner can approve all matches.');
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
     
