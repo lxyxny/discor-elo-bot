@@ -16,14 +16,7 @@ const MODES = ['1v1', '2v2'];
 
 const TOURNAMENT_TYPES = {
     'single_elimination': { name: 'Single Elimination', description: 'Players are paired in matches. The loser of each match is eliminated. Winners advance to the next round. The tournament ends when one undefeated player remains.', elimination_logic: 'single_elimination', bracket_type: 'knockout', color: 0x3498db },
-    'double_elimination': { name: 'Double Elimination', description: 'Players are eliminated only after losing two matches. All players start in the winners bracket. A first loss moves a player to the losers bracket. A second loss eliminates the player. The final winner may need to defeat the winners bracket finalist twice, depending on rules.', elimination_logic: 'double_elimination', bracket_type: 'double_bracket', color: 0xe74c3c },
-    'round_robin': { name: 'Round Robin', description: 'Each player competes against every other player a fixed number of times. No eliminations occur during play. Final rankings are determined by total wins, points, or tiebreakers.', elimination_logic: 'round_robin', bracket_type: 'league', color: 0x2ecc71 },
-    'swiss_system': { name: 'Swiss System', description: 'Players are not eliminated. All players compete for a fixed number of rounds. In each round, players with similar scores are paired. Final rankings are based on total score and tiebreakers.', elimination_logic: 'swiss_system', bracket_type: 'swiss', color: 0xf39c12 },
-    'group_stage': { name: 'Group Stage (Pools)', description: 'Players are divided into groups. Each group uses round robin or similar play. Top-ranked players from each group advance to a later elimination stage.', elimination_logic: 'group_stage', bracket_type: 'hybrid', color: 0x9b59b6 },
-    'league': { name: 'League', description: 'Players compete in a long-term schedule, often home and away. Each matchup awards points. Final standings are based on total points across the season.', elimination_logic: 'league', bracket_type: 'league', color: 0x1abc9c },
-    'knockout_seeding': { name: 'Knockout with Seeding', description: 'Players are ranked before the tournament. Higher-ranked players face lower-ranked players in early rounds. Losers are eliminated after one loss.', elimination_logic: 'single_elimination', bracket_type: 'seeded_knockout', color: 0xe67e22 },
-    'playoffs': { name: 'Playoffs', description: 'A final elimination phase following a league, group stage, or regular season. Qualified players compete in single or multi-match elimination to determine the champion.', elimination_logic: 'playoffs', bracket_type: 'knockout', color: 0x34495e },
-    'best_of_series': { name: 'Best-of Series', description: 'Each matchup consists of multiple games. A player wins the match by winning more than half of the games. The series winner advances or earns points.', elimination_logic: 'best_of_series', bracket_type: 'series', color: 0xd35400 }
+    'double_elimination': { name: 'Double Elimination', description: 'Players are eliminated only after losing two matches. All players start in the winners bracket. A first loss moves a player to the losers bracket. A second loss eliminates the player. The final winner may need to defeat the winners bracket finalist twice, depending on rules.', elimination_logic: 'double_elimination', bracket_type: 'double_bracket', color: 0xe74c3c }
 };
 
 const dbPath = path.join(__dirname, 'tournament.db');
@@ -53,9 +46,15 @@ function checkpointAndCloseDatabase() {
     });
 }
 
+function checkpointDatabase() {
+    db.run('PRAGMA wal_checkpoint(FULL);');
+}
+
 process.on('SIGINT', checkpointAndCloseDatabase);
 process.on('SIGTERM', checkpointAndCloseDatabase);
 process.on('beforeExit', checkpointAndCloseDatabase);
+
+setInterval(checkpointDatabase, 5 * 60 * 1000);
 
 // ===== Metadata Helpers =====
 function setMetadata(key, value) {
@@ -193,15 +192,10 @@ async function removeTournamentRole(guild, userId, roleName) {
 
 async function processTournamentElimination(tournamentId, matchData, guild) {
     return new Promise((resolve) => {
-        db.get('SELECT type, best_of FROM tournaments WHERE id = ?', [tournamentId], (err, tourney) => {
+        db.get('SELECT type FROM tournaments WHERE id = ?', [tournamentId], (err, tourney) => {
             if (err || !tourney) return resolve(false);
-            const { type, best_of } = tourney;
+            const { type } = tourney;
             const logic = TOURNAMENT_TYPES[type]?.elimination_logic;
-            
-            if (type === 'best_of_series') {
-                handleBestOfSeries(tournamentId, matchData, best_of, guild);
-                return resolve(true);
-            }
             
             switch (logic) {
                 case 'single_elimination':
@@ -209,18 +203,6 @@ async function processTournamentElimination(tournamentId, matchData, guild) {
                     break;
                 case 'double_elimination':
                     handleDoubleElimination(tournamentId, matchData, guild);
-                    break;
-                case 'round_robin':
-                case 'swiss_system':
-                case 'league':
-                    updatePlayerStats(tournamentId, matchData.winner_id, 'win');
-                    updatePlayerStats(tournamentId, matchData.loser_id, 'loss');
-                    break;
-                case 'group_stage':
-                    handleGroupStage(tournamentId, matchData);
-                    break;
-                case 'playoffs':
-                    handleSingleElimination(tournamentId, matchData.loser_id, guild);
                     break;
                 default:
                     handleSingleElimination(tournamentId, matchData.loser_id, guild);
@@ -248,43 +230,6 @@ function handleDoubleElimination(tournamentId, matchData, guild) {
             });
         }
     });
-    updatePlayerStats(tournamentId, winner_id, 'win');
-}
-
-function handleBestOfSeries(tournamentId, matchData, bestOf, guild) {
-    const { match_id, player1_id, player2_id, winner_id } = matchData;
-    const incrementField = winner_id === player1_id ? 'games_won_p1' : 'games_won_p2';
-    
-    db.run(`UPDATE tournament_matches SET ${incrementField} = ${incrementField} + 1 WHERE id = ?`, [match_id], () => {
-        db.get(`SELECT games_won_p1, games_won_p2, player1_id, player2_id FROM tournament_matches WHERE id = ?`, [match_id], (err, match) => {
-            if (err) return;
-            const gamesNeeded = Math.floor(bestOf / 2) + 1;
-            let seriesWinner = null;
-            if (match.games_won_p1 >= gamesNeeded) seriesWinner = match.player1_id;
-            else if (match.games_won_p2 >= gamesNeeded) seriesWinner = match.player2_id;
-            
-            if (seriesWinner) {
-                const loser = seriesWinner === match.player1_id ? match.player2_id : match.player1_id;
-                handleSingleElimination(tournamentId, loser, guild);
-                updatePlayerStats(tournamentId, seriesWinner, 'win');
-            }
-        });
-    });
-}
-
-function handleGroupStage(tournamentId, matchData) {
-    updatePlayerStats(tournamentId, matchData.winner_id, 'win');
-    updatePlayerStats(tournamentId, matchData.loser_id, 'loss');
-}
-
-function updatePlayerStats(tournamentId, playerId, result) {
-    let points = 0;
-    let field = '';
-    if (result === 'win') { points = 3; field = 'wins'; }
-    else if (result === 'loss') { points = 0; field = 'losses'; }
-    else { points = 1; field = 'draws'; }
-    
-    db.run(`UPDATE tournament_participants SET ${field} = ${field} + 1, points = points + ? WHERE tournament_id = ? AND player_id = ?`, [points, tournamentId, playerId]);
 }
 
 function calculateMMRChange(winnerMMR, loserMMR) {
@@ -1013,6 +958,7 @@ async function checkMMR(interaction) {
 // UPDATED: showLeaderboard includes laddermate
 async function showLeaderboard(interaction) {
     const mode = interaction.options.getString('mode') || '1v1';
+    const page = interaction.options.getInteger('page') || 1;
     
     if (mode === 'laddermate') {
         const lastUpdatedISO = await getMetadata('laddermate_last_updated', null);
@@ -1044,28 +990,57 @@ async function showLeaderboard(interaction) {
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
     
+    await interaction.guild.members.fetch({ withPresences: false });
+    const members = interaction.guild.members.cache.filter(member => !member.user.bot);
+    const memberIds = new Set(members.map(member => member.user.id));
+    
     db.all('SELECT id, username, mmr_data FROM players', [], (err, rows) => {
-        if (err || rows.length === 0) {
+        if (err) {
+            const embed = createErrorEmbed('Leaderboard Error', 'Failed to load leaderboard data.');
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+        
+        const players = rows
+            .filter(row => memberIds.has(row.id))
+            .map(row => {
+                try {
+                    const mmrData = JSON.parse(row.mmr_data);
+                    return { id: row.id, username: row.username, mmr: mmrData[mode] || 100 };
+                } catch {
+                    return { id: row.id, username: row.username, mmr: 100 };
+                }
+            })
+            .concat(
+                members
+                    .filter(member => !rows.some(row => row.id === member.user.id))
+                    .map(member => ({
+                        id: member.user.id,
+                        username: member.displayName || member.user.username,
+                        mmr: 100
+                    }))
+            )
+            .sort((a, b) => b.mmr - a.mmr)
+            .slice(0, 100);
+        
+        if (players.length === 0) {
             const embed = createInfoEmbed('No Players', 'No participants found.');
             return interaction.reply({ embeds: [embed] });
         }
         
-        const players = rows.map(row => {
-            try {
-                const mmrData = JSON.parse(row.mmr_data);
-                return { id: row.id, username: row.username, mmr: mmrData[mode] || 100 };
-            } catch {
-                return { id: row.id, username: row.username, mmr: 100 };
-            }
-        }).sort((a, b) => b.mmr - a.mmr).slice(0, 10);
+        const perPage = 10;
+        const totalPages = Math.max(1, Math.ceil(players.length / perPage));
+        const currentPage = Math.min(Math.max(page, 1), totalPages);
+        const startIndex = (currentPage - 1) * perPage;
+        const pageEntries = players.slice(startIndex, startIndex + perPage);
         
         let description = "";
-        players.forEach((p, i) => {
+        pageEntries.forEach((p, index) => {
             const rank = getRankName(mode, p.mmr);
-            description += `${i + 1}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
+            const position = startIndex + index + 1;
+            description += `${position}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
         });
         
-        const embed = createInfoEmbed(`🏆 ${mode} Leaderboard`, description);
+        const embed = createInfoEmbed(`🏆 ${mode} Leaderboard (Page ${currentPage}/${totalPages})`, description);
         interaction.reply({ embeds: [embed] });
     });
 }
@@ -1115,6 +1090,7 @@ async function showHelp(interaction) {
     if (interaction.user.id === BOT_OWNER_ID) {
         description += "\n👑 **OWNER ONLY**\n" +
             "/register_all    — Register all server members\n" +
+            "/savelb          — Save leaderboard data\n" +
             "/laddermate-update — Update Laddermate sync timestamp\n" +
             "/groupzones      — Group members by timezone\n";
     }
@@ -1326,40 +1302,29 @@ function getStartDateFromChoice(choice) {
 async function createTournament(interaction) {
     if (!(await isTournamentHost(interaction.user.id))) {
         const embed = createErrorEmbed('Permission Denied', 'You must be a tournament host to create tournaments.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const mode = interaction.options.getString('mode');
     const name = interaction.options.getString('name');
     const type = interaction.options.getString('type');
-    const minMMR = interaction.options.getInteger('min_mmr') || 0;
-    const maxMMR = interaction.options.getInteger('max_mmr') || 5000;
-    const mmrRange = interaction.options.getInteger('mmr_range') || 0;
     const startIn = interaction.options.getString('start_in');
     const startDate = getStartDateFromChoice(startIn);
-    const assignRole = interaction.options.getBoolean('assign_role') || false;
-    const bestOf = interaction.options.getInteger('best_of') || 1;
-    const totalRounds = interaction.options.getInteger('total_rounds') || 0;
     
     if (!TOURNAMENT_TYPES[type]) {
         const embed = createErrorEmbed('Invalid Type', 'Please select a valid tournament type.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-    
-    if (type === 'best_of_series' && bestOf % 2 === 0) {
-        const embed = createErrorEmbed('Invalid Best-of', 'Best-of series must be an odd number (1, 3, 5, etc.).');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     if (!startDate) {
         const embed = createErrorEmbed('Invalid Start Time', 'Please choose a valid start delay.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     try {
         const result = await new Promise((resolve, reject) => {
-            db.run(`INSERT INTO tournaments (name, mode, type, min_mmr, max_mmr, mmr_range, host_id, start_date, best_of, total_rounds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [name, mode, type, minMMR, maxMMR, mmrRange, interaction.user.id, startDate, bestOf, totalRounds],
+            db.run(`INSERT INTO tournaments (name, mode, type, host_id, start_date) VALUES (?, ?, ?, ?, ?)`,
+                [name, mode, type, interaction.user.id, startDate],
                 function (err) {
                     if (err) reject(err);
                     else resolve({ lastID: this.lastID });
@@ -1370,8 +1335,6 @@ async function createTournament(interaction) {
         const tournamentInfo = TOURNAMENT_TYPES[type];
         
         let description = `**📋 Format:** ${tournamentInfo.name}\n**🎮 Mode:** ${mode}\n**🆔 ID:** ${tournamentId}\n`;
-        if (type === 'best_of_series') description += `**🎯 Best-of:** ${bestOf}\n`;
-        if (totalRounds > 0) description += `**🔄 Total Rounds:** ${totalRounds}\n`;
         description += `**📅 Start Date:** ${startDate || 'Not set'}\n*${tournamentInfo.description}*`;
         
         let embed = new EmbedBuilder()
@@ -1379,28 +1342,13 @@ async function createTournament(interaction) {
             .setTitle(`✅ Tournament Created: ${name}`)
             .setDescription(description);
         
-        if (assignRole) {
-            try {
-                const roleName = `Tournament-${tournamentId}`;
-                await interaction.guild.roles.create({ 
-                    name: roleName, 
-                    color: tournamentInfo.color, 
-                    reason: `Tournament ${tournamentId}` 
-                });
-                embed.addFields({ name: '🎭 Role Created', value: `"${roleName}" for participants` });
-            } catch (error) {
-                console.error('Failed to create tournament role:', error);
-                embed.addFields({ name: '⚠️ Role Warning', value: 'Could not create Discord role.' });
-            }
-        }
-        
         logAction(interaction.user.id, interaction.user.username, 'CREATE_TOURNAMENT', `Name: ${name}, Type: ${type}, ID: ${tournamentId}`);
-        await interaction.reply({ embeds: [embed] });
+        await respondToInteraction(interaction, { embeds: [embed] });
         
     } catch (error) {
         console.error('Create tournament error:', error);
         const embed = createErrorEmbed('Creation Failed', 'Please try again later.\nError: ' + error.message);
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
 }
 
@@ -1415,11 +1363,6 @@ async function joinTournament(interaction) {
         }
         
         const playerMMR = player.mmr_data[tourney.mode] || 100;
-        if (playerMMR < tourney.min_mmr || playerMMR > tourney.max_mmr) {
-            const embed = createErrorEmbed('ELO Requirements Not Met', `Your ELO (${playerMMR}) doesn't meet requirements (${tourney.min_mmr}-${tourney.max_mmr}).`);
-            return interaction.reply({ embeds: [embed], ephemeral: true });
-        }
-        
         db.run(`INSERT OR IGNORE INTO tournament_participants (tournament_id, player_id) VALUES (?, ?)`, [tournamentId, interaction.user.id], async (err) => {
             if (err) {
                 const embed = createErrorEmbed('Failed to Join', 'Please try again later.');
@@ -1457,9 +1400,7 @@ async function showTournaments(interaction) {
             const statusEmoji = t.status === 'upcoming' ? '📅' : t.status === 'active' ? '🎮' : '✅';
             description += `${statusEmoji} **[${t.id}] ${t.name}**\n`;
             description += `Mode: ${t.mode} | Type: ${TOURNAMENT_TYPES[t.type]?.name || t.type}\n`;
-            description += `ELO: ${t.min_mmr}-${t.max_mmr}`;
-            if (t.mmr_range > 0) description += ` (±${t.mmr_range})`;
-            description += `\nDate: ${date}\n\n`;
+            description += `Date: ${date}\n\n`;
         });
         
         const embed = new EmbedBuilder()
@@ -1569,6 +1510,27 @@ async function showLogs(interaction) {
     });
 }
 
+async function saveLeaderboard(interaction) {
+    if (interaction.user.id !== BOT_OWNER_ID) {
+        const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can save leaderboard data.');
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
+    }
+    
+    try {
+        await new Promise((resolve, reject) => {
+            db.run('PRAGMA wal_checkpoint(FULL);', (err) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+        const embed = createSuccessEmbed('Leaderboard Saved', 'Database checkpoint completed successfully.');
+        await respondToInteraction(interaction, { embeds: [embed] });
+    } catch (error) {
+        const embed = createErrorEmbed('Save Failed', `Could not save leaderboard data.\nError: ${error.message || 'Unknown error'}`);
+        await respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
+    }
+}
+
 // NEW: /groupzones command
 async function groupZonesCommand(interaction) {
     await interaction.deferReply();
@@ -1671,7 +1633,8 @@ const commands = [
             { name: '1v1', value: '1v1' },
             { name: '2v2', value: '2v2' },
             { name: 'Laddermate (External)', value: 'laddermate' }
-        ])),
+        ]))
+        .addIntegerOption(o => o.setName('page').setDescription('Leaderboard page number')),
     new SlashCommandBuilder().setName('help').setDescription('Show help guide'),
     new SlashCommandBuilder().setName('match_log').setDescription('View detailed match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
     new SlashCommandBuilder().setName('match_history').setDescription('View match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
@@ -1691,13 +1654,7 @@ const commands = [
             { name: '1 month', value: '1_month' },
             { name: '2 months', value: '2_months' }
         ]))
-        .addStringOption(o => o.setName('type').setDescription('Tournament type').setRequired(true).addChoices(Object.entries(TOURNAMENT_TYPES).map(([value, type]) => ({ name: type.name, value }))))
-        .addIntegerOption(o => o.setName('min_mmr').setDescription('Minimum ELO'))
-        .addIntegerOption(o => o.setName('max_mmr').setDescription('Maximum ELO'))
-        .addIntegerOption(o => o.setName('mmr_range').setDescription('ELO range'))
-        .addBooleanOption(o => o.setName('assign_role').setDescription('Create Discord role for participants'))
-        .addIntegerOption(o => o.setName('best_of').setDescription('Best-of games (for series)'))
-        .addIntegerOption(o => o.setName('total_rounds').setDescription('Total rounds (for Swiss/League)')),
+        .addStringOption(o => o.setName('type').setDescription('Tournament type').setRequired(true).addChoices(Object.entries(TOURNAMENT_TYPES).map(([value, type]) => ({ name: type.name, value })))),
     new SlashCommandBuilder().setName('join_tournament').setDescription('Join a tournament').addIntegerOption(o => o.setName('id').setDescription('Tournament ID').setRequired(true)),
     new SlashCommandBuilder().setName('tournaments').setDescription('View tournaments').addStringOption(o => o.setName('status').setDescription('Filter by status').addChoices([{ name: 'All', value: 'all' }, { name: 'Upcoming', value: 'upcoming' }, { name: 'Active', value: 'active' }, { name: 'Completed', value: 'completed' }])),
     new SlashCommandBuilder().setName('award_title').setDescription('Award title to winner (hosts only)')
@@ -1709,6 +1666,7 @@ const commands = [
         .addStringOption(o => o.setName('title').setDescription('Title to equip')),
     new SlashCommandBuilder().setName('tournament_types').setDescription('View all available tournament formats'),
     new SlashCommandBuilder().setName('logs').setDescription('View action logs (owners/verifiers only)'),
+    new SlashCommandBuilder().setName('savelb').setDescription('✅ [OWNER] Save leaderboard data'),
     new SlashCommandBuilder().setName('laddermate-update').setDescription('✅ [OWNER] Update Laddermate last-sync timestamp'),
     new SlashCommandBuilder().setName('groupzones').setDescription('ParallelGroup members by timezone roles (UTC±X) with 3-hour max range')
 ].map(cmd => cmd.toJSON());
@@ -1716,7 +1674,9 @@ const commands = [
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers  // REQUIRED for /register_all and /groupzones
+        GatewayIntentBits.GuildMembers,  // REQUIRED for /register_all and /groupzones
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
     ]
 });
 
@@ -1771,6 +1731,7 @@ const commandHandlers = {
     'manage_title': manageTitle,
     'tournament_types': showTournamentTypes,
     'logs': showLogs,
+    'savelb': saveLeaderboard,
     'laddermate-update': handleLaddermateUpdate,
     'groupzones': groupZonesCommand
 };
@@ -1783,7 +1744,7 @@ client.on('interactionCreate', async interaction => {
     const AUTO_DEFER_COMMANDS = new Set([
         'submit_match', 'approve_match', 'approve_all', 'create_tournament', 'join_tournament',
         'reset_all', 'undo_last', 'add_verifier', 'remove_verifier',
-        'blacklist', 'unblacklist', 'award_title', 'laddermate-update', 'manage_title'
+        'blacklist', 'unblacklist', 'award_title', 'laddermate-update', 'manage_title', 'savelb'
     ]);
     
     if (AUTO_DEFER_COMMANDS.has(commandName) && !interaction.deferred && !interaction.replied) {
@@ -1811,6 +1772,27 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ embeds: [embed], ephemeral: true });
         }
     }
+});
+
+client.on('messageCreate', async message => {
+    if (message.author.bot) return;
+    if (!client.user) return;
+    
+    const mentionPrefix = `<@${client.user.id}>`;
+    const mentionNicknamePrefix = `<@!${client.user.id}>`;
+    const content = message.content?.trim() || '';
+    
+    let stripped = '';
+    if (content.startsWith(mentionPrefix)) {
+        stripped = content.slice(mentionPrefix.length).trim();
+    } else if (content.startsWith(mentionNicknamePrefix)) {
+        stripped = content.slice(mentionNicknamePrefix.length).trim();
+    }
+    
+    if (!stripped) return;
+    
+    const reply = `🤖 You said: ${stripped}`;
+    await message.reply(reply);
 });
 
 client.login(BOT_TOKEN).catch(err => {
