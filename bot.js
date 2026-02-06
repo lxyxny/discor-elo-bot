@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
@@ -262,6 +262,44 @@ function createErrorEmbed(title, description) {
 
 function createInfoEmbed(title, description, color = 0x3498db) {
     return new EmbedBuilder().setColor(color).setTitle(title).setDescription(description).setTimestamp().setFooter({ text: 'Tournament System' });
+}
+
+function buildLeaderboardEmbed({ mode, players, page, perPage }) {
+    const totalPages = Math.max(1, Math.ceil(players.length / perPage));
+    const currentPage = Math.min(Math.max(page, 1), totalPages);
+    const startIndex = (currentPage - 1) * perPage;
+    const pageEntries = players.slice(startIndex, startIndex + perPage);
+    
+    let description = '';
+    pageEntries.forEach((p, index) => {
+        const rank = getRankName(mode, p.mmr);
+        const position = startIndex + index + 1;
+        description += `${position}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
+    });
+    
+    if (!description) {
+        description = 'No participants found.';
+    }
+    
+    return createInfoEmbed(`🏆 ${mode} Leaderboard (Page ${currentPage}/${totalPages})`, description);
+}
+
+function buildLeaderboardButtons(mode, page, totalPages) {
+    const prevDisabled = page <= 1;
+    const nextDisabled = page >= totalPages;
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`lb:${mode}:${page - 1}`)
+            .setLabel('⬅️')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(prevDisabled),
+        new ButtonBuilder()
+            .setCustomId(`lb:${mode}:${page + 1}`)
+            .setLabel('➡️')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(nextDisabled)
+    );
+    return row;
 }
 
 async function setupRainbowRole(guild) {
@@ -550,69 +588,24 @@ async function submitMatch(interaction) {
             loserPlayers.push(player);
         }
         
-        const winnerMax = Math.max(...winnerPlayers.map(p => p.mmr_data[mode]));
-        const loserMax = Math.max(...loserPlayers.map(p => p.mmr_data[mode]));
-        
-        const isAuthorizedSubmitter = await isAuthorized(interaction.user.id);
-        
-        if (isAuthorizedSubmitter) {
-            const mmrChange = calculateMMRChange(winnerMax, loserMax);
-            const winnerMMRBefore = JSON.stringify(winnerPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
-            const loserMMRBefore = JSON.stringify(loserPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
-            
-            for (const player of winnerPlayers) {
-                const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] + mmrChange };
-                db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
-            }
-            
-            for (const player of loserPlayers) {
-                const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] - mmrChange };
-                db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
-            }
-            
-            db.run(`INSERT INTO matches (mode, winner_team, loser_team, winner_mmr_before, loser_mmr_before, mmr_change, approved, approved_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-                [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam), winnerMMRBefore, loserMMRBefore, mmrChange, interaction.user.id],
-                function (err) {
-                    if (err) {
-                        console.error("Insert match error:", err);
-                        return interaction.followUp?.({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-                    }
-                    
-                    const matchNumber = this.lastID;
-                    const wNames = winnerPlayers.map(p => p.username).join(', ');
-                    const lNames = loserPlayers.map(p => p.username).join(', ');
-                    
-                    logAction(interaction.user.id, interaction.user.username, 'SUBMIT_MATCH', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-                    
-                    const embed = createSuccessEmbed('Match Recorded',
-                        `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\n**ELO Change:** ±${mmrChange}`);
-                    
-                    if (interaction.replied || interaction.deferred) {
-                        interaction.followUp({ embeds: [embed] });
-                    } else {
-                        interaction.reply({ embeds: [embed] });
-                    }
-                });
-        } else {
-            db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
-                [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
-                function (err) {
-                    if (err) {
-                        return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-                    }
-                    
-                    const matchNumber = this.lastID;
-                    const wNames = winnerPlayers.map(p => p.username).join(', ');
-                    const lNames = loserPlayers.map(p => p.username).join(', ');
-                    
-                    logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-                    
-                    const embed = createInfoEmbed('Submission Received',
-                        `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by staff.`, 0xf39c12);
-                    
-                    interaction.reply({ embeds: [embed] });
-                });
-        }
+        db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
+            [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
+            function (err) {
+                if (err) {
+                    return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+                }
+                
+                const matchNumber = this.lastID;
+                const wNames = winnerPlayers.map(p => p.username).join(', ');
+                const lNames = loserPlayers.map(p => p.username).join(', ');
+                
+                logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
+                
+                const embed = createInfoEmbed('Submission Received',
+                    `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by a verifier.`, 0xf39c12);
+                
+                interaction.reply({ embeds: [embed] });
+            });
     } catch (error) {
         console.error("Submit match error:", error);
         const embed = createErrorEmbed('Submission Failed', 'Ensure all players are registered with `/register`.');
@@ -958,7 +951,6 @@ async function checkMMR(interaction) {
 // UPDATED: showLeaderboard includes laddermate
 async function showLeaderboard(interaction) {
     const mode = interaction.options.getString('mode') || '1v1';
-    const page = interaction.options.getInteger('page') || 1;
     
     if (mode === 'laddermate') {
         const lastUpdatedISO = await getMetadata('laddermate_last_updated', null);
@@ -994,7 +986,7 @@ async function showLeaderboard(interaction) {
     const members = interaction.guild.members.cache.filter(member => !member.user.bot);
     const memberIds = new Set(members.map(member => member.user.id));
     
-    db.all('SELECT id, username, mmr_data FROM players', [], (err, rows) => {
+    db.all('SELECT id, username, mmr_data FROM players', [], async (err, rows) => {
         if (err) {
             const embed = createErrorEmbed('Leaderboard Error', 'Failed to load leaderboard data.');
             return interaction.reply({ embeds: [embed], ephemeral: true });
@@ -1022,26 +1014,47 @@ async function showLeaderboard(interaction) {
             .sort((a, b) => b.mmr - a.mmr)
             .slice(0, 100);
         
-        if (players.length === 0) {
-            const embed = createInfoEmbed('No Players', 'No participants found.');
-            return interaction.reply({ embeds: [embed] });
-        }
-        
         const perPage = 10;
         const totalPages = Math.max(1, Math.ceil(players.length / perPage));
-        const currentPage = Math.min(Math.max(page, 1), totalPages);
-        const startIndex = (currentPage - 1) * perPage;
-        const pageEntries = players.slice(startIndex, startIndex + perPage);
+        let currentPage = 1;
+        const embed = buildLeaderboardEmbed({ mode, players, page: currentPage, perPage });
+        const components = totalPages > 1 ? [buildLeaderboardButtons(mode, currentPage, totalPages)] : [];
         
-        let description = "";
-        pageEntries.forEach((p, index) => {
-            const rank = getRankName(mode, p.mmr);
-            const position = startIndex + index + 1;
-            description += `${position}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
+        const message = await interaction.reply({ embeds: [embed], components, fetchReply: true });
+        if (totalPages <= 1) return;
+        
+        const collector = message.createMessageComponentCollector({
+            componentType: ComponentType.Button,
+            time: 120000
         });
         
-        const embed = createInfoEmbed(`🏆 ${mode} Leaderboard (Page ${currentPage}/${totalPages})`, description);
-        interaction.reply({ embeds: [embed] });
+        collector.on('collect', async buttonInteraction => {
+            if (buttonInteraction.user.id !== interaction.user.id) {
+                return buttonInteraction.reply({ content: 'Only the command user can change pages.', ephemeral: true });
+            }
+            
+            const [prefix, buttonMode, pageStr] = buttonInteraction.customId.split(':');
+            if (prefix !== 'lb' || buttonMode !== mode) {
+                return buttonInteraction.deferUpdate();
+            }
+            
+            const nextPage = Number(pageStr);
+            const safePage = Number.isFinite(nextPage) ? nextPage : 1;
+            currentPage = Math.min(Math.max(safePage, 1), totalPages);
+            const updatedEmbed = buildLeaderboardEmbed({ mode, players, page: currentPage, perPage });
+            const updatedRow = buildLeaderboardButtons(mode, currentPage, totalPages);
+            await buttonInteraction.update({ embeds: [updatedEmbed], components: [updatedRow] });
+        });
+        
+        collector.on('end', async () => {
+            try {
+                const finalRow = buildLeaderboardButtons(mode, currentPage, totalPages);
+                finalRow.components.forEach(component => component.setDisabled(true));
+                await message.edit({ components: [finalRow] });
+            } catch (error) {
+                console.error('Failed to disable leaderboard buttons:', error);
+            }
+        });
     });
 }
 
@@ -1633,8 +1646,7 @@ const commands = [
             { name: '1v1', value: '1v1' },
             { name: '2v2', value: '2v2' },
             { name: 'Laddermate (External)', value: 'laddermate' }
-        ]))
-        .addIntegerOption(o => o.setName('page').setDescription('Leaderboard page number')),
+        ])),
     new SlashCommandBuilder().setName('help').setDescription('Show help guide'),
     new SlashCommandBuilder().setName('match_log').setDescription('View detailed match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
     new SlashCommandBuilder().setName('match_history').setDescription('View match history').addUserOption(o => o.setName('user').setDescription('Player to check')),
@@ -1791,7 +1803,25 @@ client.on('messageCreate', async message => {
     
     if (!stripped) return;
     
-    const reply = `🤖 You said: ${stripped}`;
+    const lower = stripped.toLowerCase();
+    let reply = `🤖 You said: ${stripped}`;
+    
+    if (lower.includes('help')) {
+        reply = '🤖 Need help? Try `/help` to see commands or ask me about leaderboards, tournaments, or matches.';
+    } else if (lower.includes('leaderboard')) {
+        reply = '🤖 You can view rankings with `/leaderboard mode:1v1` or `/leaderboard mode:2v2`.';
+    } else if (lower.includes('tournament')) {
+        reply = '🤖 Create a tournament with `/create_tournament` or browse with `/tournaments`.';
+    } else if (lower.includes('submit')) {
+        reply = '🤖 Submit match results with `/submit_match`. A verifier will review it.';
+    } else if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) {
+        reply = '🤖 Hey! What can I help you with today?';
+    } else if (lower.includes('thanks') || lower.includes('thank you')) {
+        reply = '🤖 You’re welcome!';
+    } else if (lower.endsWith('?')) {
+        reply = '🤖 Good question! Give me a little more detail and I’ll try to help.';
+    }
+    
     await message.reply(reply);
 });
 
