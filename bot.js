@@ -539,7 +539,7 @@ async function submitMatch(interaction) {
     const submitterBanned = await isBlacklisted(interaction.user.id);
     if (submitterBanned) {
         const embed = createErrorEmbed('Restricted', 'You are restricted from submitting results.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const mode = interaction.options.getString('mode');
@@ -554,7 +554,7 @@ async function submitMatch(interaction) {
         const loser2 = interaction.options.getUser('loser2');
         if (!winner2 || !loser2) {
             const embed = createErrorEmbed('Invalid Team Size', '2v2 requires 2 players per team.');
-            return interaction.reply({ embeds: [embed], ephemeral: true });
+            return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
         winnerTeam.push(winner2.id);
         loserTeam.push(loser2.id);
@@ -563,13 +563,13 @@ async function submitMatch(interaction) {
     const allPlayers = [...new Set([...winnerTeam, ...loserTeam])];
     if (allPlayers.length !== winnerTeam.length + loserTeam.length) {
         const embed = createErrorEmbed('Invalid Submission', 'Players cannot be on both teams.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     for (const id of allPlayers) {
         if (await isBlacklisted(id)) {
             const embed = createErrorEmbed('Restricted Player', 'A participant is restricted from tournament activity.');
-            return interaction.reply({ embeds: [embed], ephemeral: true });
+            return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
     }
     
@@ -611,7 +611,7 @@ async function submitMatch(interaction) {
                 [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam), winnerMMRBefore, loserMMRBefore, mmrChange, interaction.user.id],
                 function (err) {
                     if (err) {
-                        return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+                        return respondToInteraction(interaction, { embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
                     }
                     
                     const matchNumber = this.lastID;
@@ -623,14 +623,14 @@ async function submitMatch(interaction) {
                     const embed = createSuccessEmbed('Match Recorded',
                         `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\n**ELO Change:** ±${mmrChange}`);
                     
-                    interaction.reply({ embeds: [embed] });
+                    respondToInteraction(interaction, { embeds: [embed] });
                 });
         } else {
             db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
                 [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
                 function (err) {
                     if (err) {
-                        return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+                        return respondToInteraction(interaction, { embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
                     }
                     
                     const matchNumber = this.lastID;
@@ -642,13 +642,13 @@ async function submitMatch(interaction) {
                     const embed = createInfoEmbed('Match Submitted for Review',
                         `**Match #${matchNumber}**\n**Submission ID:** ${matchNumber}\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by a verifier.`, 0xf39c12);
                     
-                    interaction.reply({ embeds: [embed] });
+                    respondToInteraction(interaction, { embeds: [embed] });
                 });
         }
     } catch (error) {
         console.error("Submit match error:", error);
         const embed = createErrorEmbed('Submission Failed', 'Ensure all players are registered with `/register`.');
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
 }
 
@@ -683,7 +683,7 @@ async function approveAllMatches(interaction) {
     const isAuth = await isAuthorized(interaction.user.id);
     if (!isAuth) {
         const embed = createErrorEmbed('Permission Denied', 'Only verifiers or the owner can approve all matches.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     db.all('SELECT * FROM matches WHERE approved = 0', async (err, matches) => {
@@ -766,7 +766,7 @@ async function approveMatch(interaction) {
     db.get('SELECT * FROM matches WHERE id = ? AND approved = 0', [matchId], async (err, match) => {
         if (err || !match) {
             const embed = createErrorEmbed('Submission Not Found', 'The submission ID is invalid or already processed.');
-            return interaction.reply({ embeds: [embed], ephemeral: true });
+            return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
         
         const mode = match.mode;
@@ -1029,7 +1029,7 @@ async function showLeaderboard(interaction) {
     db.all('SELECT id, username, mmr_data FROM players', [], async (err, rows) => {
         if (err) {
             const embed = createErrorEmbed('Leaderboard Error', 'Failed to load leaderboard data.');
-            return interaction.reply({ embeds: [embed], ephemeral: true });
+            return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
         
         const players = rows
@@ -1294,7 +1294,7 @@ async function showProfile(interaction) {
 async function addTournamentHost(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can assign tournament hosts.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
@@ -1412,7 +1412,7 @@ async function joinTournament(interaction) {
     db.get('SELECT * FROM tournaments WHERE id = ?', [tournamentId], async (err, tourney) => {
         if (err || !tourney) {
             const embed = createErrorEmbed('Tournament Not Found', 'The tournament ID is invalid.');
-            return interaction.reply({ embeds: [embed], ephemeral: true });
+            return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
         
         const playerMMR = player.mmr_data[tourney.mode] || 100;
