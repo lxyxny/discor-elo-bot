@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
@@ -16,14 +16,7 @@ const MODES = ['1v1', '2v2'];
 
 const TOURNAMENT_TYPES = {
     'single_elimination': { name: 'Single Elimination', description: 'Players are paired in matches. The loser of each match is eliminated. Winners advance to the next round. The tournament ends when one undefeated player remains.', elimination_logic: 'single_elimination', bracket_type: 'knockout', color: 0x3498db },
-    'double_elimination': { name: 'Double Elimination', description: 'Players are eliminated only after losing two matches. All players start in the winners bracket. A first loss moves a player to the losers bracket. A second loss eliminates the player. The final winner may need to defeat the winners bracket finalist twice, depending on rules.', elimination_logic: 'double_elimination', bracket_type: 'double_bracket', color: 0xe74c3c },
-    'round_robin': { name: 'Round Robin', description: 'Each player competes against every other player a fixed number of times. No eliminations occur during play. Final rankings are determined by total wins, points, or tiebreakers.', elimination_logic: 'round_robin', bracket_type: 'league', color: 0x2ecc71 },
-    'swiss_system': { name: 'Swiss System', description: 'Players are not eliminated. All players compete for a fixed number of rounds. In each round, players with similar scores are paired. Final rankings are based on total score and tiebreakers.', elimination_logic: 'swiss_system', bracket_type: 'swiss', color: 0xf39c12 },
-    'group_stage': { name: 'Group Stage (Pools)', description: 'Players are divided into groups. Each group uses round robin or similar play. Top-ranked players from each group advance to a later elimination stage.', elimination_logic: 'group_stage', bracket_type: 'hybrid', color: 0x9b59b6 },
-    'league': { name: 'League', description: 'Players compete in a long-term schedule, often home and away. Each matchup awards points. Final standings are based on total points across the season.', elimination_logic: 'league', bracket_type: 'league', color: 0x1abc9c },
-    'knockout_seeding': { name: 'Knockout with Seeding', description: 'Players are ranked before the tournament. Higher-ranked players face lower-ranked players in early rounds. Losers are eliminated after one loss.', elimination_logic: 'single_elimination', bracket_type: 'seeded_knockout', color: 0xe67e22 },
-    'playoffs': { name: 'Playoffs', description: 'A final elimination phase following a league, group stage, or regular season. Qualified players compete in single or multi-match elimination to determine the champion.', elimination_logic: 'playoffs', bracket_type: 'knockout', color: 0x34495e },
-    'best_of_series': { name: 'Best-of Series', description: 'Each matchup consists of multiple games. A player wins the match by winning more than half of the games. The series winner advances or earns points.', elimination_logic: 'best_of_series', bracket_type: 'series', color: 0xd35400 }
+    'double_elimination': { name: 'Double Elimination', description: 'Players are eliminated only after losing two matches. All players start in the winners bracket. A first loss moves a player to the losers bracket. A second loss eliminates the player. The final winner may need to defeat the winners bracket finalist twice, depending on rules.', elimination_logic: 'double_elimination', bracket_type: 'double_bracket', color: 0xe74c3c }
 };
 
 const dbPath = path.join(__dirname, 'tournament.db');
@@ -45,6 +38,23 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, username TEXT, action TEXT, details TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
     db.run(`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)`);
 });
+
+function checkpointAndCloseDatabase() {
+    db.serialize(() => {
+        db.run('PRAGMA wal_checkpoint(FULL);');
+        db.close();
+    });
+}
+
+function checkpointDatabase() {
+    db.run('PRAGMA wal_checkpoint(FULL);');
+}
+
+process.on('SIGINT', checkpointAndCloseDatabase);
+process.on('SIGTERM', checkpointAndCloseDatabase);
+process.on('beforeExit', checkpointAndCloseDatabase);
+
+setInterval(checkpointDatabase, 5 * 60 * 1000);
 
 // ===== Metadata Helpers =====
 function setMetadata(key, value) {
@@ -182,15 +192,10 @@ async function removeTournamentRole(guild, userId, roleName) {
 
 async function processTournamentElimination(tournamentId, matchData, guild) {
     return new Promise((resolve) => {
-        db.get('SELECT type, best_of FROM tournaments WHERE id = ?', [tournamentId], (err, tourney) => {
+        db.get('SELECT type FROM tournaments WHERE id = ?', [tournamentId], (err, tourney) => {
             if (err || !tourney) return resolve(false);
-            const { type, best_of } = tourney;
+            const { type } = tourney;
             const logic = TOURNAMENT_TYPES[type]?.elimination_logic;
-            
-            if (type === 'best_of_series') {
-                handleBestOfSeries(tournamentId, matchData, best_of, guild);
-                return resolve(true);
-            }
             
             switch (logic) {
                 case 'single_elimination':
@@ -198,18 +203,6 @@ async function processTournamentElimination(tournamentId, matchData, guild) {
                     break;
                 case 'double_elimination':
                     handleDoubleElimination(tournamentId, matchData, guild);
-                    break;
-                case 'round_robin':
-                case 'swiss_system':
-                case 'league':
-                    updatePlayerStats(tournamentId, matchData.winner_id, 'win');
-                    updatePlayerStats(tournamentId, matchData.loser_id, 'loss');
-                    break;
-                case 'group_stage':
-                    handleGroupStage(tournamentId, matchData);
-                    break;
-                case 'playoffs':
-                    handleSingleElimination(tournamentId, matchData.loser_id, guild);
                     break;
                 default:
                     handleSingleElimination(tournamentId, matchData.loser_id, guild);
@@ -237,43 +230,6 @@ function handleDoubleElimination(tournamentId, matchData, guild) {
             });
         }
     });
-    updatePlayerStats(tournamentId, winner_id, 'win');
-}
-
-function handleBestOfSeries(tournamentId, matchData, bestOf, guild) {
-    const { match_id, player1_id, player2_id, winner_id } = matchData;
-    const incrementField = winner_id === player1_id ? 'games_won_p1' : 'games_won_p2';
-    
-    db.run(`UPDATE tournament_matches SET ${incrementField} = ${incrementField} + 1 WHERE id = ?`, [match_id], () => {
-        db.get(`SELECT games_won_p1, games_won_p2, player1_id, player2_id FROM tournament_matches WHERE id = ?`, [match_id], (err, match) => {
-            if (err) return;
-            const gamesNeeded = Math.floor(bestOf / 2) + 1;
-            let seriesWinner = null;
-            if (match.games_won_p1 >= gamesNeeded) seriesWinner = match.player1_id;
-            else if (match.games_won_p2 >= gamesNeeded) seriesWinner = match.player2_id;
-            
-            if (seriesWinner) {
-                const loser = seriesWinner === match.player1_id ? match.player2_id : match.player1_id;
-                handleSingleElimination(tournamentId, loser, guild);
-                updatePlayerStats(tournamentId, seriesWinner, 'win');
-            }
-        });
-    });
-}
-
-function handleGroupStage(tournamentId, matchData) {
-    updatePlayerStats(tournamentId, matchData.winner_id, 'win');
-    updatePlayerStats(tournamentId, matchData.loser_id, 'loss');
-}
-
-function updatePlayerStats(tournamentId, playerId, result) {
-    let points = 0;
-    let field = '';
-    if (result === 'win') { points = 3; field = 'wins'; }
-    else if (result === 'loss') { points = 0; field = 'losses'; }
-    else { points = 1; field = 'draws'; }
-    
-    db.run(`UPDATE tournament_participants SET ${field} = ${field} + 1, points = points + ? WHERE tournament_id = ? AND player_id = ?`, [points, tournamentId, playerId]);
 }
 
 function calculateMMRChange(winnerMMR, loserMMR) {
@@ -289,6 +245,13 @@ function logAction(userId, username, action, details = '') {
     db.run('INSERT INTO logs (user_id, username, action, details) VALUES (?, ?, ?, ?)', [userId, username, action, details]);
 }
 
+function respondToInteraction(interaction, payload) {
+    if (interaction.deferred || interaction.replied) {
+        return interaction.editReply(payload);
+    }
+    return interaction.reply(payload);
+}
+
 function createSuccessEmbed(title, description) {
     return new EmbedBuilder().setColor(0x2ecc71).setTitle(`✅ ${title}`).setDescription(description).setTimestamp().setFooter({ text: 'Tournament System' });
 }
@@ -299,6 +262,44 @@ function createErrorEmbed(title, description) {
 
 function createInfoEmbed(title, description, color = 0x3498db) {
     return new EmbedBuilder().setColor(color).setTitle(title).setDescription(description).setTimestamp().setFooter({ text: 'Tournament System' });
+}
+
+function buildLeaderboardEmbed({ mode, players, page, perPage }) {
+    const totalPages = Math.max(1, Math.ceil(players.length / perPage));
+    const currentPage = Math.min(Math.max(page, 1), totalPages);
+    const startIndex = (currentPage - 1) * perPage;
+    const pageEntries = players.slice(startIndex, startIndex + perPage);
+    
+    let description = '';
+    pageEntries.forEach((p, index) => {
+        const rank = getRankName(mode, p.mmr);
+        const position = startIndex + index + 1;
+        description += `${position}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
+    });
+    
+    if (!description) {
+        description = 'No participants found.';
+    }
+    
+    return createInfoEmbed(`🏆 ${mode} Leaderboard (Page ${currentPage}/${totalPages})`, description);
+}
+
+function buildLeaderboardButtons(mode, page, totalPages) {
+    const prevDisabled = page <= 1;
+    const nextDisabled = page >= totalPages;
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`lb:${mode}:${page - 1}`)
+            .setLabel('⬅️')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(prevDisabled),
+        new ButtonBuilder()
+            .setCustomId(`lb:${mode}:${page + 1}`)
+            .setLabel('➡️')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(nextDisabled)
+    );
+    return row;
 }
 
 async function setupRainbowRole(guild) {
@@ -587,69 +588,24 @@ async function submitMatch(interaction) {
             loserPlayers.push(player);
         }
         
-        const winnerMax = Math.max(...winnerPlayers.map(p => p.mmr_data[mode]));
-        const loserMax = Math.max(...loserPlayers.map(p => p.mmr_data[mode]));
-        
-        const isAuthorizedSubmitter = await isAuthorized(interaction.user.id);
-        
-        if (isAuthorizedSubmitter) {
-            const mmrChange = calculateMMRChange(winnerMax, loserMax);
-            const winnerMMRBefore = JSON.stringify(winnerPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
-            const loserMMRBefore = JSON.stringify(loserPlayers.map(p => ({ id: p.id, mmr: p.mmr_data[mode] })));
-            
-            for (const player of winnerPlayers) {
-                const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] + mmrChange };
-                db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
-            }
-            
-            for (const player of loserPlayers) {
-                const newData = { ...player.mmr_data, [mode]: player.mmr_data[mode] - mmrChange };
-                db.run('UPDATE players SET mmr_data = ? WHERE id = ?', [JSON.stringify(newData), player.id]);
-            }
-            
-            db.run(`INSERT INTO matches (mode, winner_team, loser_team, winner_mmr_before, loser_mmr_before, mmr_change, approved, approved_by) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-                [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam), winnerMMRBefore, loserMMRBefore, mmrChange, interaction.user.id],
-                function (err) {
-                    if (err) {
-                        console.error("Insert match error:", err);
-                        return interaction.followUp?.({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-                    }
-                    
-                    const matchNumber = this.lastID;
-                    const wNames = winnerPlayers.map(p => p.username).join(', ');
-                    const lNames = loserPlayers.map(p => p.username).join(', ');
-                    
-                    logAction(interaction.user.id, interaction.user.username, 'SUBMIT_MATCH', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-                    
-                    const embed = createSuccessEmbed('Match Recorded',
-                        `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\n**ELO Change:** ±${mmrChange}`);
-                    
-                    if (interaction.replied || interaction.deferred) {
-                        interaction.followUp({ embeds: [embed] });
-                    } else {
-                        interaction.reply({ embeds: [embed] });
-                    }
-                });
-        } else {
-            db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
-                [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
-                function (err) {
-                    if (err) {
-                        return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
-                    }
-                    
-                    const matchNumber = this.lastID;
-                    const wNames = winnerPlayers.map(p => p.username).join(', ');
-                    const lNames = loserPlayers.map(p => p.username).join(', ');
-                    
-                    logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
-                    
-                    const embed = createInfoEmbed('Submission Received',
-                        `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by staff.`, 0xf39c12);
-                    
-                    interaction.reply({ embeds: [embed] });
-                });
-        }
+        db.run(`INSERT INTO matches (mode, winner_team, loser_team, mmr_change) VALUES (?, ?, ?, 0)`,
+            [mode, JSON.stringify(winnerTeam), JSON.stringify(loserTeam)],
+            function (err) {
+                if (err) {
+                    return interaction.reply({ embeds: [createErrorEmbed('Submission Failed', 'Database error.')], ephemeral: true });
+                }
+                
+                const matchNumber = this.lastID;
+                const wNames = winnerPlayers.map(p => p.username).join(', ');
+                const lNames = loserPlayers.map(p => p.username).join(', ');
+                
+                logAction(interaction.user.id, interaction.user.username, 'SUBMIT_PENDING', `Match #${matchNumber}, Mode: ${mode}, Winners: ${wNames}, Losers: ${lNames}`);
+                
+                const embed = createInfoEmbed('Submission Received',
+                    `**Match #${matchNumber}**\n**Mode:** ${mode}\n**Winners:** ${wNames}\n**Losers:** ${lNames}\nAwaiting verification by a verifier.`, 0xf39c12);
+                
+                interaction.reply({ embeds: [embed] });
+            });
     } catch (error) {
         console.error("Submit match error:", error);
         const embed = createErrorEmbed('Submission Failed', 'Ensure all players are registered with `/register`.');
@@ -841,18 +797,18 @@ async function approveMatch(interaction) {
 async function addVerifier(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may assign verifier roles.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
     db.run('INSERT INTO verifiers (id, username) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username', [user.id, user.username], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to assign verifier role.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'ADD_VERIFIER', `User: ${user.username} (${user.id})`);
             const embed = createSuccessEmbed('Verifier Role Assigned', `✅ Verifier role assigned to <@${user.id}>.`);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -860,18 +816,18 @@ async function addVerifier(interaction) {
 async function removeVerifier(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may revoke verifier roles.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
     db.run('DELETE FROM verifiers WHERE id = ?', [user.id], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to revoke verifier role.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'REMOVE_VERIFIER', `User: ${user.username} (${user.id})`);
             const embed = createInfoEmbed('Verifier Role Removed', `🗑️ Verifier role removed from <@${user.id}>.`, 0xe74c3c);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -879,7 +835,7 @@ async function removeVerifier(interaction) {
 async function blacklistUser(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may manage the restriction list.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
@@ -887,11 +843,11 @@ async function blacklistUser(interaction) {
     db.run('INSERT OR REPLACE INTO blacklist (id, username, reason) VALUES (?, ?, ?)', [user.id, user.username, reason], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to restrict user.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'BLACKLIST', `User: ${user.username} (${user.id}), Reason: ${reason}`);
             const embed = createInfoEmbed('User Restricted', `🚫 User <@${user.id}> has been restricted.\nReason: ${reason}`, 0xe74c3c);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -899,18 +855,18 @@ async function blacklistUser(interaction) {
 async function unblacklistUser(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may modify the restriction list.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const user = interaction.options.getUser('user');
     db.run('DELETE FROM blacklist WHERE id = ?', [user.id], (err) => {
         if (err) {
             const embed = createErrorEmbed('Failed', 'Failed to lift restriction.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         } else {
             logAction(interaction.user.id, interaction.user.username, 'UNBLACKLIST', `User: ${user.username} (${user.id})`);
             const embed = createSuccessEmbed('Restriction Lifted', `✅ Restriction lifted for <@${user.id}>.`);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         }
     });
 }
@@ -918,20 +874,20 @@ async function unblacklistUser(interaction) {
 async function resetAll(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reset tournament data.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     db.run('DELETE FROM matches');
     db.run('UPDATE players SET mmr_data = \'{}\'');
     logAction(interaction.user.id, interaction.user.username, 'RESET_ALL', 'All tournament data reset');
     const embed = createInfoEmbed('🚨 TOURNAMENT RESET INITIATED', 'All player ratings restored to default (100 ELO).', 0xe74c3c);
-    await interaction.reply({ embeds: [embed] });
+    await respondToInteraction(interaction, { embeds: [embed] });
 }
 
 async function undoLastMatch(interaction) {
     if (interaction.user.id !== BOT_OWNER_ID) {
         const embed = createErrorEmbed('Permission Denied', 'Only the system owner may reverse match results.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     db.get('SELECT * FROM matches WHERE approved = 1 ORDER BY id DESC LIMIT 1', [], (err, match) => {
@@ -961,14 +917,14 @@ async function undoLastMatch(interaction) {
                 db.run('DELETE FROM matches WHERE id = ?', [match.id]);
                 logAction(interaction.user.id, interaction.user.username, 'UNDO_MATCH', `Match #${match.id}`);
                 const embed = createSuccessEmbed('Match Reversed', `↩️ Reversed **Match #${match.id}**. Ratings restored.`);
-                interaction.reply({ embeds: [embed] });
+                respondToInteraction(interaction, { embeds: [embed] });
             }).catch(() => {
                 const embed = createErrorEmbed('Undo Failed', 'Failed to restore player ratings.');
-                interaction.reply({ embeds: [embed], ephemeral: true });
+                respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
             });
         } catch (e) {
             const embed = createErrorEmbed('Undo Failed', 'An error occurred during reversal.');
-            interaction.reply({ embeds: [embed], ephemeral: true });
+            respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
         }
     });
 }
@@ -1026,29 +982,79 @@ async function showLeaderboard(interaction) {
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
     
-    db.all('SELECT id, username, mmr_data FROM players', [], (err, rows) => {
-        if (err || rows.length === 0) {
-            const embed = createInfoEmbed('No Players', 'No participants found.');
-            return interaction.reply({ embeds: [embed] });
+    await interaction.guild.members.fetch({ withPresences: false });
+    const members = interaction.guild.members.cache.filter(member => !member.user.bot);
+    const memberIds = new Set(members.map(member => member.user.id));
+    
+    db.all('SELECT id, username, mmr_data FROM players', [], async (err, rows) => {
+        if (err) {
+            const embed = createErrorEmbed('Leaderboard Error', 'Failed to load leaderboard data.');
+            return interaction.reply({ embeds: [embed], ephemeral: true });
         }
         
-        const players = rows.map(row => {
-            try {
-                const mmrData = JSON.parse(row.mmr_data);
-                return { id: row.id, username: row.username, mmr: mmrData[mode] || 100 };
-            } catch {
-                return { id: row.id, username: row.username, mmr: 100 };
-            }
-        }).sort((a, b) => b.mmr - a.mmr).slice(0, 10);
+        const players = rows
+            .filter(row => memberIds.has(row.id))
+            .map(row => {
+                try {
+                    const mmrData = JSON.parse(row.mmr_data);
+                    return { id: row.id, username: row.username, mmr: mmrData[mode] || 100 };
+                } catch {
+                    return { id: row.id, username: row.username, mmr: 100 };
+                }
+            })
+            .concat(
+                members
+                    .filter(member => !rows.some(row => row.id === member.user.id))
+                    .map(member => ({
+                        id: member.user.id,
+                        username: member.displayName || member.user.username,
+                        mmr: 100
+                    }))
+            )
+            .sort((a, b) => b.mmr - a.mmr)
+            .slice(0, 100);
         
-        let description = "";
-        players.forEach((p, i) => {
-            const rank = getRankName(mode, p.mmr);
-            description += `${i + 1}. **${p.username}** — ${p.mmr} ELO (**${rank}**)\n`;
+        const perPage = 10;
+        const totalPages = Math.max(1, Math.ceil(players.length / perPage));
+        let currentPage = 1;
+        const embed = buildLeaderboardEmbed({ mode, players, page: currentPage, perPage });
+        const components = totalPages > 1 ? [buildLeaderboardButtons(mode, currentPage, totalPages)] : [];
+        
+        const message = await interaction.reply({ embeds: [embed], components, fetchReply: true });
+        if (totalPages <= 1) return;
+        
+        const collector = message.createMessageComponentCollector({
+            componentType: ComponentType.Button,
+            time: 120000
         });
         
-        const embed = createInfoEmbed(`🏆 ${mode} Leaderboard`, description);
-        interaction.reply({ embeds: [embed] });
+        collector.on('collect', async buttonInteraction => {
+            if (buttonInteraction.user.id !== interaction.user.id) {
+                return buttonInteraction.reply({ content: 'Only the command user can change pages.', ephemeral: true });
+            }
+            
+            const [prefix, buttonMode, pageStr] = buttonInteraction.customId.split(':');
+            if (prefix !== 'lb' || buttonMode !== mode) {
+                return buttonInteraction.deferUpdate();
+            }
+            
+            const nextPage = Number(pageStr);
+            const safePage = Number.isFinite(nextPage) ? nextPage : 1;
+            currentPage = Math.min(Math.max(safePage, 1), totalPages);
+            const updatedEmbed = buildLeaderboardEmbed({ mode, players, page: currentPage, perPage });
+            const updatedRow = buildLeaderboardButtons(mode, currentPage, totalPages);
+            await buttonInteraction.update({ embeds: [updatedEmbed], components: [updatedRow] });
+        });
+        
+        collector.on('end', async () => {
+            try {
+                const finalRow = buildLeaderboardButtons(mode, currentPage, totalPages);
+                finalRow.components.forEach(component => component.setDisabled(true));
+                await message.edit({ components: [finalRow] });
+            } catch (error) {
+                console.error('Failed to disable leaderboard buttons:', error);
+            }
+        });
     });
 }
 
@@ -1097,6 +1103,7 @@ async function showHelp(interaction) {
     if (interaction.user.id === BOT_OWNER_ID) {
         description += "\n👑 **OWNER ONLY**\n" +
             "/register_all    — Register all server members\n" +
+            "/savelb          — Save leaderboard data\n" +
             "/laddermate-update — Update Laddermate sync timestamp\n" +
             "/groupzones      — Group members by timezone\n";
     }
@@ -1282,51 +1289,55 @@ async function removeTournamentHost(interaction) {
     });
 }
 
-// VALIDATE DATE FORMAT
-function isValidDate(dateStr) {
-    const regex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!regex.test(dateStr)) return false;
-    const d = new Date(dateStr);
-    return d.toISOString().slice(0, 10) === dateStr;
+function formatDateYYYYMMDD(date) {
+    return date.toISOString().slice(0, 10);
+}
+
+function getStartDateFromChoice(choice) {
+    const offsets = {
+        '1_day': 1,
+        '2_days': 2,
+        '3_days': 3,
+        '1_week': 7,
+        '2_weeks': 14,
+        '4_weeks': 28,
+        '1_month': 30,
+        '2_months': 60
+    };
+    const days = offsets[choice];
+    if (!days) return null;
+    const start = new Date();
+    start.setDate(start.getDate() + days);
+    return formatDateYYYYMMDD(start);
 }
 
 // FIXED: createTournament - Proper interaction handling
 async function createTournament(interaction) {
     if (!(await isTournamentHost(interaction.user.id))) {
         const embed = createErrorEmbed('Permission Denied', 'You must be a tournament host to create tournaments.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
-    const name = interaction.options.getString('name');
     const mode = interaction.options.getString('mode');
+    const name = interaction.options.getString('name');
     const type = interaction.options.getString('type');
-    const minMMR = interaction.options.getInteger('min_mmr') || 0;
-    const maxMMR = interaction.options.getInteger('max_mmr') || 5000;
-    const mmrRange = interaction.options.getInteger('mmr_range') || 0;
-    const startDate = interaction.options.getString('start_date');
-    const assignRole = interaction.options.getBoolean('assign_role') || false;
-    const bestOf = interaction.options.getInteger('best_of') || 1;
-    const totalRounds = interaction.options.getInteger('total_rounds') || 0;
+    const startIn = interaction.options.getString('start_in');
+    const startDate = getStartDateFromChoice(startIn);
     
     if (!TOURNAMENT_TYPES[type]) {
         const embed = createErrorEmbed('Invalid Type', 'Please select a valid tournament type.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
-    if (type === 'best_of_series' && bestOf % 2 === 0) {
-        const embed = createErrorEmbed('Invalid Best-of', 'Best-of series must be an odd number (1, 3, 5, etc.).');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-    
-    if (startDate && !isValidDate(startDate)) {
-        const embed = createErrorEmbed('Invalid Date', 'Start date must be in YYYY-MM-DD format.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+    if (!startDate) {
+        const embed = createErrorEmbed('Invalid Start Time', 'Please choose a valid start delay.');
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     try {
         const result = await new Promise((resolve, reject) => {
-            db.run(`INSERT INTO tournaments (name, mode, type, min_mmr, max_mmr, mmr_range, host_id, start_date, best_of, total_rounds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [name, mode, type, minMMR, maxMMR, mmrRange, interaction.user.id, startDate, bestOf, totalRounds],
+            db.run(`INSERT INTO tournaments (name, mode, type, host_id, start_date) VALUES (?, ?, ?, ?, ?)`,
+                [name, mode, type, interaction.user.id, startDate],
                 function (err) {
                     if (err) reject(err);
                     else resolve({ lastID: this.lastID });
@@ -1337,8 +1348,6 @@ async function createTournament(interaction) {
         const tournamentInfo = TOURNAMENT_TYPES[type];
         
         let description = `**📋 Format:** ${tournamentInfo.name}\n**🎮 Mode:** ${mode}\n**🆔 ID:** ${tournamentId}\n`;
-        if (type === 'best_of_series') description += `**🎯 Best-of:** ${bestOf}\n`;
-        if (totalRounds > 0) description += `**🔄 Total Rounds:** ${totalRounds}\n`;
         description += `**📅 Start Date:** ${startDate || 'Not set'}\n*${tournamentInfo.description}*`;
         
         let embed = new EmbedBuilder()
@@ -1346,28 +1355,13 @@ async function createTournament(interaction) {
             .setTitle(`✅ Tournament Created: ${name}`)
             .setDescription(description);
         
-        if (assignRole) {
-            try {
-                const roleName = `Tournament-${tournamentId}`;
-                await interaction.guild.roles.create({ 
-                    name: roleName, 
-                    color: tournamentInfo.color, 
-                    reason: `Tournament ${tournamentId}` 
-                });
-                embed.addFields({ name: '🎭 Role Created', value: `"${roleName}" for participants` });
-            } catch (error) {
-                console.error('Failed to create tournament role:', error);
-                embed.addFields({ name: '⚠️ Role Warning', value: 'Could not create Discord role.' });
-            }
-        }
-        
         logAction(interaction.user.id, interaction.user.username, 'CREATE_TOURNAMENT', `Name: ${name}, Type: ${type}, ID: ${tournamentId}`);
-        await interaction.reply({ embeds: [embed] });
+        await respondToInteraction(interaction, { embeds: [embed] });
         
     } catch (error) {
         console.error('Create tournament error:', error);
         const embed = createErrorEmbed('Creation Failed', 'Please try again later.\nError: ' + error.message);
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
 }
 
@@ -1382,11 +1376,6 @@ async function joinTournament(interaction) {
         }
         
         const playerMMR = player.mmr_data[tourney.mode] || 100;
-        if (playerMMR < tourney.min_mmr || playerMMR > tourney.max_mmr) {
-            const embed = createErrorEmbed('ELO Requirements Not Met', `Your ELO (${playerMMR}) doesn't meet requirements (${tourney.min_mmr}-${tourney.max_mmr}).`);
-            return interaction.reply({ embeds: [embed], ephemeral: true });
-        }
-        
         db.run(`INSERT OR IGNORE INTO tournament_participants (tournament_id, player_id) VALUES (?, ?)`, [tournamentId, interaction.user.id], async (err) => {
             if (err) {
                 const embed = createErrorEmbed('Failed to Join', 'Please try again later.');
@@ -1424,9 +1413,7 @@ async function showTournaments(interaction) {
             const statusEmoji = t.status === 'upcoming' ? '📅' : t.status === 'active' ? '🎮' : '✅';
             description += `${statusEmoji} **[${t.id}] ${t.name}**\n`;
             description += `Mode: ${t.mode} | Type: ${TOURNAMENT_TYPES[t.type]?.name || t.type}\n`;
-            description += `ELO: ${t.min_mmr}-${t.max_mmr}`;
-            if (t.mmr_range > 0) description += ` (±${t.mmr_range})`;
-            description += `\nDate: ${date}\n\n`;
+            description += `Date: ${date}\n\n`;
         });
         
         const embed = new EmbedBuilder()
@@ -1441,7 +1428,7 @@ async function showTournaments(interaction) {
 async function awardTitle(interaction) {
     if (!(await isTournamentHost(interaction.user.id))) {
         const embed = createErrorEmbed('Permission Denied', 'Only tournament hosts can award titles.');
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
     }
     
     const tournamentId = interaction.options.getInteger('tournament_id');
@@ -1453,7 +1440,7 @@ async function awardTitle(interaction) {
     
     logAction(interaction.user.id, interaction.user.username, 'AWARD_TITLE', `Title: "${title}", Winner: ${winner.username} (${winner.id}), Tournament ID: ${tournamentId}`);
     const embed = createSuccessEmbed('Title Awarded', `🏆 Title "${title}" awarded to <@${winner.id}>!`);
-    interaction.reply({ embeds: [embed] });
+    respondToInteraction(interaction, { embeds: [embed] });
 }
 
 async function manageTitle(interaction) {
@@ -1464,18 +1451,18 @@ async function manageTitle(interaction) {
         db.get('SELECT 1 FROM player_titles WHERE player_id = ? AND title = ?', [interaction.user.id, title], (err, row) => {
             if (!row) {
                 const embed = createErrorEmbed('Title Not Owned', 'You don\'t own this title.');
-                return interaction.reply({ embeds: [embed], ephemeral: true });
+                return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
             }
             db.run('UPDATE players SET equipped_title = ? WHERE id = ?', [title, interaction.user.id]);
             logAction(interaction.user.id, interaction.user.username, 'EQUIP_TITLE', `Title: "${title}"`);
             const embed = createSuccessEmbed('Title Equipped', `✨ Equipped title: "${title}"`);
-            interaction.reply({ embeds: [embed] });
+            respondToInteraction(interaction, { embeds: [embed] });
         });
     } else {
         db.run('UPDATE players SET equipped_title = "" WHERE id = ?', [interaction.user.id]);
         logAction(interaction.user.id, interaction.user.username, 'UNEQUIP_TITLE', '');
         const embed = createSuccessEmbed('Title Unequipped', '✨ Unequipped title.');
-        interaction.reply({ embeds: [embed] });
+        respondToInteraction(interaction, { embeds: [embed] });
     }
 }
 
@@ -1534,6 +1521,27 @@ async function showLogs(interaction) {
         
         interaction.reply({ embeds: [embed] });
     });
+}
+
+async function saveLeaderboard(interaction) {
+    if (interaction.user.id !== BOT_OWNER_ID) {
+        const embed = createErrorEmbed('Permission Denied', 'Only the bot owner can save leaderboard data.');
+        return respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
+    }
+    
+    try {
+        await new Promise((resolve, reject) => {
+            db.run('PRAGMA wal_checkpoint(FULL);', (err) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+        const embed = createSuccessEmbed('Leaderboard Saved', 'Database checkpoint completed successfully.');
+        await respondToInteraction(interaction, { embeds: [embed] });
+    } catch (error) {
+        const embed = createErrorEmbed('Save Failed', `Could not save leaderboard data.\nError: ${error.message || 'Unknown error'}`);
+        await respondToInteraction(interaction, { embeds: [embed], ephemeral: true });
+    }
 }
 
 // NEW: /groupzones command
@@ -1646,16 +1654,19 @@ const commands = [
     new SlashCommandBuilder().setName('add_tournament_host').setDescription('Add tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to promote').setRequired(true)),
     new SlashCommandBuilder().setName('remove_tournament_host').setDescription('Remove tournament host (owner only)').addUserOption(o => o.setName('user').setDescription('User to demote').setRequired(true)),
     new SlashCommandBuilder().setName('create_tournament').setDescription('Create a tournament (hosts only)')
-        .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
         .addStringOption(o => o.setName('mode').setDescription('Game mode').setRequired(true).addChoices(MODES.map(m => ({ name: m, value: m }))))
-        .addStringOption(o => o.setName('type').setDescription('Tournament type').setRequired(true).addChoices(Object.entries(TOURNAMENT_TYPES).map(([value, type]) => ({ name: type.name, value }))))
-        .addIntegerOption(o => o.setName('min_mmr').setDescription('Minimum ELO'))
-        .addIntegerOption(o => o.setName('max_mmr').setDescription('Maximum ELO'))
-        .addIntegerOption(o => o.setName('mmr_range').setDescription('ELO range'))
-        .addStringOption(o => o.setName('start_date').setDescription('Start date (YYYY-MM-DD)'))
-        .addBooleanOption(o => o.setName('assign_role').setDescription('Create Discord role for participants'))
-        .addIntegerOption(o => o.setName('best_of').setDescription('Best-of games (for series)'))
-        .addIntegerOption(o => o.setName('total_rounds').setDescription('Total rounds (for Swiss/League)')),
+        .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
+        .addStringOption(o => o.setName('start_in').setDescription('Start delay').setRequired(true).addChoices([
+            { name: '1 day', value: '1_day' },
+            { name: '2 days', value: '2_days' },
+            { name: '3 days', value: '3_days' },
+            { name: '1 week', value: '1_week' },
+            { name: '2 weeks', value: '2_weeks' },
+            { name: '4 weeks', value: '4_weeks' },
+            { name: '1 month', value: '1_month' },
+            { name: '2 months', value: '2_months' }
+        ]))
+        .addStringOption(o => o.setName('type').setDescription('Tournament type').setRequired(true).addChoices(Object.entries(TOURNAMENT_TYPES).map(([value, type]) => ({ name: type.name, value })))),
     new SlashCommandBuilder().setName('join_tournament').setDescription('Join a tournament').addIntegerOption(o => o.setName('id').setDescription('Tournament ID').setRequired(true)),
     new SlashCommandBuilder().setName('tournaments').setDescription('View tournaments').addStringOption(o => o.setName('status').setDescription('Filter by status').addChoices([{ name: 'All', value: 'all' }, { name: 'Upcoming', value: 'upcoming' }, { name: 'Active', value: 'active' }, { name: 'Completed', value: 'completed' }])),
     new SlashCommandBuilder().setName('award_title').setDescription('Award title to winner (hosts only)')
@@ -1667,6 +1678,7 @@ const commands = [
         .addStringOption(o => o.setName('title').setDescription('Title to equip')),
     new SlashCommandBuilder().setName('tournament_types').setDescription('View all available tournament formats'),
     new SlashCommandBuilder().setName('logs').setDescription('View action logs (owners/verifiers only)'),
+    new SlashCommandBuilder().setName('savelb').setDescription('✅ [OWNER] Save leaderboard data'),
     new SlashCommandBuilder().setName('laddermate-update').setDescription('✅ [OWNER] Update Laddermate last-sync timestamp'),
     new SlashCommandBuilder().setName('groupzones').setDescription('ParallelGroup members by timezone roles (UTC±X) with 3-hour max range')
 ].map(cmd => cmd.toJSON());
@@ -1674,7 +1686,9 @@ const commands = [
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers  // REQUIRED for /register_all and /groupzones
+        GatewayIntentBits.GuildMembers,  // REQUIRED for /register_all and /groupzones
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
     ]
 });
 
@@ -1729,6 +1743,7 @@ const commandHandlers = {
     'manage_title': manageTitle,
     'tournament_types': showTournamentTypes,
     'logs': showLogs,
+    'savelb': saveLeaderboard,
     'laddermate-update': handleLaddermateUpdate,
     'groupzones': groupZonesCommand
 };
@@ -1738,13 +1753,13 @@ client.on('interactionCreate', async interaction => {
     
     const { commandName } = interaction;
     
-    const SLOW_COMMANDS = [
+    const AUTO_DEFER_COMMANDS = new Set([
         'submit_match', 'approve_match', 'approve_all', 'create_tournament', 'join_tournament',
         'reset_all', 'undo_last', 'add_verifier', 'remove_verifier',
-        'blacklist', 'unblacklist', 'award_title', 'register_all', 'laddermate-update', 'groupzones'
-    ];
+        'blacklist', 'unblacklist', 'award_title', 'laddermate-update', 'manage_title', 'savelb'
+    ]);
     
-    if (SLOW_COMMANDS.includes(commandName)) {
+    if (AUTO_DEFER_COMMANDS.has(commandName) && !interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: false });
     }
     
@@ -1769,6 +1784,45 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ embeds: [embed], ephemeral: true });
         }
     }
+});
+
+client.on('messageCreate', async message => {
+    if (message.author.bot) return;
+    if (!client.user) return;
+    
+    const mentionPrefix = `<@${client.user.id}>`;
+    const mentionNicknamePrefix = `<@!${client.user.id}>`;
+    const content = message.content?.trim() || '';
+    
+    let stripped = '';
+    if (content.startsWith(mentionPrefix)) {
+        stripped = content.slice(mentionPrefix.length).trim();
+    } else if (content.startsWith(mentionNicknamePrefix)) {
+        stripped = content.slice(mentionNicknamePrefix.length).trim();
+    }
+    
+    if (!stripped) return;
+    
+    const lower = stripped.toLowerCase();
+    let reply = `🤖 You said: ${stripped}`;
+    
+    if (lower.includes('help')) {
+        reply = '🤖 Need help? Try `/help` to see commands or ask me about leaderboards, tournaments, or matches.';
+    } else if (lower.includes('leaderboard')) {
+        reply = '🤖 You can view rankings with `/leaderboard mode:1v1` or `/leaderboard mode:2v2`.';
+    } else if (lower.includes('tournament')) {
+        reply = '🤖 Create a tournament with `/create_tournament` or browse with `/tournaments`.';
+    } else if (lower.includes('submit')) {
+        reply = '🤖 Submit match results with `/submit_match`. A verifier will review it.';
+    } else if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) {
+        reply = '🤖 Hey! What can I help you with today?';
+    } else if (lower.includes('thanks') || lower.includes('thank you')) {
+        reply = '🤖 You’re welcome!';
+    } else if (lower.endsWith('?')) {
+        reply = '🤖 Good question! Give me a little more detail and I’ll try to help.';
+    }
+    
+    await message.reply(reply);
 });
 
 client.login(BOT_TOKEN).catch(err => {
