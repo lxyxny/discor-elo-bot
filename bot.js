@@ -1,43 +1,153 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
+const { 
+    Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST, EmbedBuilder, 
+    ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType 
+} = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const cron = require('node-cron');
 
+// --- CONFIGURATION ---
 const BOT_OWNER_ID = process.env.BOT_OWNER_ID;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const APPLICATION_ID = process.env.APPLICATION_ID;
-
-if (!BOT_TOKEN || !APPLICATION_ID || !BOT_OWNER_ID) {
-    console.error('❌ Missing required environment variables. Check your .env file.');
-    process.exit(1);
-}
-
+const GAME_ROOM_CHANNEL_ID = '1496461396546814032';
 const MODES = ['1v1', '2v2'];
 
-const TOURNAMENT_TYPES = {
-    'single_elimination': { name: 'Single Elimination', description: 'Players are paired in matches. The loser of each match is eliminated. Winners advance to the next round. The tournament ends when one undefeated player remains.', elimination_logic: 'single_elimination', bracket_type: 'knockout', color: 0x3498db },
-    'double_elimination': { name: 'Double Elimination', description: 'Players are eliminated only after losing two matches. All players start in the winners bracket. A first loss moves a player to the losers bracket. A second loss eliminates the player. The final winner may need to defeat the winners bracket finalist twice, depending on rules.', elimination_logic: 'double_elimination', bracket_type: 'double_bracket', color: 0xe74c3c }
-};
-
+// --- DATABASE INITIALIZATION ---
 const dbPath = path.join(__dirname, 'tournament.db');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
     db.run("PRAGMA journal_mode=WAL;");
-    db.run("PRAGMA synchronous=NORMAL;");
-    
     db.run(`CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, username TEXT, mmr_data TEXT DEFAULT '{}', equipped_title TEXT DEFAULT '')`);
-    db.run(`CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, winner_team TEXT NOT NULL, loser_team TEXT NOT NULL, winner_mmr_before TEXT, loser_mmr_before TEXT, mmr_change INTEGER NOT NULL, approved BOOLEAN DEFAULT 0, approved_by TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+    db.run(`CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT, winner_team TEXT, loser_team TEXT, winner_mmr_before TEXT, loser_mmr_before TEXT, mmr_change INTEGER, approved BOOLEAN DEFAULT 0, approved_by TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+    db.run(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)`);
+    db.run(`CREATE TABLE IF NOT EXISTS player_titles (player_id TEXT, title TEXT, awarded_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
     db.run(`CREATE TABLE IF NOT EXISTS verifiers (id TEXT PRIMARY KEY, username TEXT)`);
-    db.run(`CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, username TEXT, reason TEXT)`);
-    db.run(`CREATE TABLE IF NOT EXISTS tournament_hosts (id TEXT PRIMARY KEY, username TEXT)`);
-    db.run(`CREATE TABLE IF NOT EXISTS tournaments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, mode TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'upcoming', min_mmr INTEGER DEFAULT 0, max_mmr INTEGER DEFAULT 5000, mmr_range INTEGER DEFAULT 0, host_id TEXT NOT NULL, start_date TEXT, total_rounds INTEGER DEFAULT 0, current_round INTEGER DEFAULT 0, best_of INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    db.run(`CREATE TABLE IF NOT EXISTS tournament_participants (tournament_id INTEGER, player_id TEXT, eliminated BOOLEAN DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, draws INTEGER DEFAULT 0, points INTEGER DEFAULT 0, rank INTEGER, bracket_position TEXT, seed INTEGER, FOREIGN KEY (tournament_id) REFERENCES tournaments(id), FOREIGN KEY (player_id) REFERENCES players(id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS tournament_matches (id INTEGER PRIMARY KEY AUTOINCREMENT, tournament_id INTEGER, match_id INTEGER, round INTEGER, match_type TEXT, player1_id TEXT, player2_id TEXT, winner_id TEXT, games_won_p1 INTEGER DEFAULT 0, games_won_p2 INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', bracket_position TEXT, FOREIGN KEY (tournament_id) REFERENCES tournaments(id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS player_titles (player_id TEXT, title TEXT, tournament_id INTEGER, awarded_by TEXT, awarded_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (player_id) REFERENCES players(id), FOREIGN KEY (tournament_id) REFERENCES tournaments(id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, username TEXT, action TEXT, details TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    db.run(`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)`);
+
+    // Init Season Data
+    db.run(`INSERT OR IGNORE INTO config (key, value) VALUES ('current_season', '1')`);
+    db.run(`INSERT OR IGNORE INTO config (key, value) VALUES ('next_reset', ?)`, [new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).toISOString()]);
 });
+
+// --- ROCKET LEAGUE MMR & RANKING LOGIC ---
+
+function getRankAndDivision(mode, elo) {
+    const tiers = mode === '1v1' 
+        ? [{n:'Beginner',m:0},{n:'Amateur',m:500},{n:'Challenge',m:800},{n:'Semi-Pro',m:1000},{n:'Professional',m:1250},{n:'Ascendant',m:1500},{n:'Godlike',m:2000}]
+        : [{n:'Beginner',m:0},{n:'Amateur',m:450},{n:'Challenge',m:650},{n:'Semi-Pro',m:850},{n:'Professional',m:1050},{n:'Ascendant',m:1250},{n:'Godlike',m:2000}];
+
+    let tierIndex = 0;
+    for(let i = tiers.length - 1; i >= 0; i--) {
+        if(elo >= tiers[i].m) { tierIndex = i; break; }
+    }
+    const currentTier = tiers[tierIndex];
+    if (currentTier.n === 'Godlike') return 'Godlike';
+
+    const nextTier = tiers[tierIndex + 1];
+    const range = nextTier.m - currentTier.m;
+    const progress = elo - currentTier.m;
+    const divValue = Math.floor((progress / range) * 4) + 1;
+    const romans = ['I', 'II', 'III', 'IV'];
+    return `${currentTier.n} ${romans[Math.min(divValue - 1, 3)]}`;
+}
+
+function getWeightedTeamMMR(playersMMR) {
+    if (playersMMR.length === 1) return playersMMR[0];
+    const max = Math.max(...playersMMR);
+    const min = Math.min(...playersMMR);
+    return max >= 1250 ? max : (max * 0.8) + (min * 0.2); // RL Anti-Boost
+}
+
+function calculateMMRChange(winnerWeighted, loserWeighted, winCount) {
+    let K = winCount < 20 ? 80 : 32; // Placement boost
+    const expected = 1 / (1 + Math.pow(10, (loserWeighted - winnerWeighted) / 400));
+    return Math.max(1, Math.min(Math.round(K * (1 - expected)), 100));
+}
+
+// --- AUTOMATED TASKS ---
+
+// 1. Friday 3:00 PM GMT Game Room
+cron.schedule('0 15 * * 5', async () => {
+    const channel = client.channels.cache.get(GAME_ROOM_CHANNEL_ID);
+    if (!channel) return;
+
+    const embed = new EmbedBuilder()
+        .setColor(0x3498db)
+        .setTitle('🎮 Weekly Game Room Sign-Up')
+        .setDescription("Click below to join today's matches! Teams will be randomized.\n\n**Participants:**\n*None yet*");
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('game_signup').setLabel('Sign Up').setStyle(ButtonStyle.Success).setEmoji('✅'),
+        new ButtonBuilder().setCustomId('game_leave').setLabel('Leave').setStyle(ButtonStyle.Danger).setEmoji('❌'),
+        new ButtonBuilder().setCustomId('game_start').setLabel('Randomize (Host)').setStyle(ButtonStyle.Primary).setEmoji('🎲')
+    );
+
+    const message = await channel.send({ content: "@everyone Friday games are starting! 🚀", embeds: [embed], components: [row] });
+    const participants = new Set();
+    const collector = message.createMessageComponentCollector({ componentType: ComponentType.Button, time: 28800000 });
+
+    collector.on('collect', async i => {
+        if (i.customId === 'game_signup') participants.add(i.user.username);
+        else if (i.customId === 'game_leave') participants.delete(i.user.username);
+        else if (i.customId === 'game_start') {
+            if (i.user.id !== BOT_OWNER_ID) return i.reply({ content: "Only host can start!", ephemeral: true });
+            if (participants.size < 2) return i.reply({ content: "Need 2+ players!", ephemeral: true });
+            const shuffled = [...participants].sort(() => Math.random() - 0.5);
+            let teams = "### 🎲 Randomized Teams\n";
+            for (let j = 0; j < shuffled.length; j += 2) {
+                teams += `**Match ${Math.floor(j/2)+1}:** ${shuffled[j]} & ${shuffled[j+1] || '*(Need player)*'}\n`;
+            }
+            return i.reply({ content: teams });
+        }
+        const list = participants.size > 0 ? [...participants].map(p => `• ${p}`).join('\n') : "*None yet*";
+        const updated = EmbedBuilder.from(embed).setDescription(`**Participants (${participants.size}):**\n${list}`);
+        await i.update({ embeds: [updated] });
+    });
+}, { timezone: "Etc/GMT" });
+
+// 2. Monthly Season Reset
+setInterval(() => {
+    db.get("SELECT value FROM config WHERE key = 'next_reset'", [], (err, row) => {
+        if (row && new Date() >= new Date(row.value)) {
+            db.all("SELECT id, mmr_data FROM players", (err, players) => {
+                players.forEach(p => {
+                    let data = JSON.parse(p.mmr_data);
+                    MODES.forEach(m => data[m] = Math.round((data[m] || 100) * 0.6 + 240)); // Soft Reset
+                    db.run("UPDATE players SET mmr_data = ? WHERE id = ?", [JSON.stringify(data), p.id]);
+                });
+                db.get("SELECT value FROM config WHERE key = 'current_season'", (err, s) => {
+                    db.run("UPDATE config SET value = ? WHERE key = 'current_season'", [parseInt(s.value) + 1]);
+                    db.run("UPDATE config SET value = ? WHERE key = 'next_reset'", [new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).toISOString()]);
+                });
+            });
+        }
+    });
+}, 3600000);
+
+// --- MAIN CLIENT & COMMANDS ---
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+    const { commandName } = interaction;
+
+    if (commandName === 'stats') {
+        const target = interaction.options.getUser('user') || interaction.user;
+        db.get("SELECT * FROM players WHERE id = ?", [target.id], (err, player) => {
+            if (!player) return interaction.reply("User not registered.");
+            const data = JSON.parse(player.mmr_data);
+            let desc = `### 📊 ${target.username}'s Stats\n`;
+            MODES.forEach(m => desc += `**${m}:** ${data[m] || 100} MMR (${getRankAndDivision(m, data[m] || 100)})\n`);
+            interaction.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setDescription(desc)] });
+        });
+    }
+
+    if (commandName === 'rank_info') {
+        const embed = new EmbedBuilder().setTitle('🏅 Rank Info').setDescription("**1v1 Thresholds:**\n• Godlike: 2000+\n• Ascendant: 1500\n• Professional: 1250\n• Semi-Pro: 1000\n• Challenge: 800\n• Amateur: 500");
+        interaction.reply({ embeds: [embed], ephemeral: true });
+    }
 
 function checkpointAndCloseDatabase() {
     db.serialize(() => {
@@ -1856,6 +1966,7 @@ client.on('messageCreate', async message => {
     }
     
     await message.reply(reply);
+});
 });
 
 client.login(BOT_TOKEN).catch(err => {

@@ -1,7 +1,8 @@
 {
   "dependencies": {
-    "discord.js": "^14.25.1",
-    "dotenv": "^17.2.3",
+    "discord.js": "^14.26.3",
+    "dotenv": "^17.4.2",
+    "node-cron": "^4.2.1",
     "sqlite3": "^5.1.7"
   },
   "name": "discord-elo-bot",
@@ -10,7 +11,7 @@
   "main": "bot.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-   "start": "node bot.js"
+    "start": "node bot.js"
   },
   "keywords": [],
   "author": "",
