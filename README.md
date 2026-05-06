@@ -1,4 +1,4 @@
-# Discord ELO Bot - Copilot Instructions
+# HELLO :)
 
 ## System Overview
 This is a **Discord.js-based tournament and ELO rating system** for competitive gaming. The entire bot is a single Node.js file (`bot.js`) that manages player ratings, match submissions, tournament brackets, and admin roles.
