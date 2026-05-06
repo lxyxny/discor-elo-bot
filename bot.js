@@ -2,11 +2,13 @@ require('dotenv').config();
 
 const {
   Client, GatewayIntentBits, SlashCommandBuilder, Routes, REST,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  PermissionsBitField
 } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const cron = require('node-cron');
+const Groq = require('groq-sdk');
 
 // ======================
 // ENVIRONMENT & CONFIG
@@ -24,7 +26,21 @@ if (!BOT_TOKEN || !APPLICATION_ID || !BOT_OWNER_ID) {
   process.exit(1);
 }
 
-const MODES = ['1v1', '2v2'];
+const GROQ_API_KEY = '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';
+const groq = new Groq({ apiKey: GROQ_API_KEY });
+
+// Tenor GIF API (free tier) — swap key at tenor.com/developers if needed
+const TENOR_API_KEY = 'AIzaSyAyimkuYQYF_FXVALexPZTp9knNXMfE0kI';
+
+// Per-user cooldown to prevent spam
+const chatCooldowns = new Map();
+const CHAT_COOLDOWN_MS = 2500;
+
+// Max messages to pull from the log as conversation context
+const MAX_LOG_CONTEXT   = 200;  // cross-channel server history fed to system prompt
+const MAX_CHAN_CONTEXT  = 40;   // recent messages from *this* channel shown as chat turns
+
+
 
 const TOURNAMENT_TYPES = {
   'single_elimination': { name: 'Single Elimination', description: 'Players are paired in matches. The loser of each match is eliminated. Winners advance to the next round. The tournament ends when one undefeated player remains.', elimination_logic: 'single_elimination', bracket_type: 'knockout', color: 0x3498db },
@@ -178,6 +194,21 @@ db.serialize(() => {
     channel_id TEXT,
     queued_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // message_log: persistent store of every message seen in the server
+  db.run(`CREATE TABLE IF NOT EXISTS message_log (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT,
+    channel_id TEXT,
+    channel_name TEXT,
+    author_id TEXT,
+    author_name TEXT,
+    content TEXT,
+    attachments TEXT,
+    timestamp INTEGER
+  )`);
+  // Index for fast recency queries
+  db.run(`CREATE INDEX IF NOT EXISTS idx_msglog_ts ON message_log (guild_id, timestamp DESC)`);
 
   // Safe migrations for existing databases
   db.run(`ALTER TABLE players ADD COLUMN wins_data TEXT DEFAULT '{}'`, () => {});
@@ -1385,12 +1416,21 @@ const commands = [
 // CLIENT & STARTUP
 // ======================
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ]
+});
 
 client.once('ready', async () => {
   console.log(`✅ Bot ready as ${client.user.tag}`);
   client.guilds.cache.forEach(async (guild) => { await setupRainbowRole(guild); });
   startCronJobs(client);
+  // Backfill: fetch recent messages from every readable channel on startup
+  await backfillMessageHistory(client);
 });
 
 client.on('guildCreate', async (guild) => { await setupRainbowRole(guild); });
@@ -1457,6 +1497,351 @@ client.on('interactionCreate', async interaction => {
     const embed = createErrorEmbed('Command Failed', 'An unexpected error occurred. Please notify staff.');
     if (interaction.replied || interaction.deferred) await interaction.followUp({ embeds: [embed], ephemeral: true });
     else await interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+});
+
+// ======================
+// MESSAGE LOGGING
+// ======================
+
+/**
+ * Persist a Discord message to the message_log table.
+ * Silently ignores messages with no meaningful content.
+ */
+function logMessage(msg) {
+  if (!msg.guild) return;
+  // Skip bot messages and empty system messages
+  if (msg.author?.bot) return;
+  const content = msg.content || '';
+  const attachments = msg.attachments?.size
+    ? [...msg.attachments.values()].map(a => a.url).join(' ')
+    : '';
+  if (!content && !attachments) return;
+
+  const channelName = msg.channel?.name || 'unknown';
+  const ts = msg.createdTimestamp || Date.now();
+
+  db.run(
+    `INSERT OR IGNORE INTO message_log
+       (id, guild_id, channel_id, channel_name, author_id, author_name, content, attachments, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [msg.id, msg.guild.id, msg.channel.id, channelName,
+     msg.author.id, msg.author.username, content, attachments, ts]
+  );
+}
+
+/**
+ * On startup, fetch the last ~100 messages from every text channel the bot
+ * can read, and store them into message_log for immediate context.
+ */
+async function backfillMessageHistory(client) {
+  console.log('[HISTORY] Starting message backfill...');
+  let total = 0;
+  for (const guild of client.guilds.cache.values()) {
+    for (const channel of guild.channels.cache.values()) {
+      if (!channel.isTextBased()) continue;
+      // Check bot has permission to read this channel
+      const me = guild.members.cache.get(client.user.id);
+      if (me && !channel.permissionsFor(me)?.has('ReadMessageHistory')) continue;
+      try {
+        const fetched = await channel.messages.fetch({ limit: 100 });
+        for (const msg of fetched.values()) {
+          if (msg.author?.bot) continue;
+          const content = msg.content || '';
+          const attachments = [...msg.attachments.values()].map(a => a.url).join(' ');
+          if (!content && !attachments) continue;
+          const ts = msg.createdTimestamp;
+          db.run(
+            `INSERT OR IGNORE INTO message_log
+               (id, guild_id, channel_id, channel_name, author_id, author_name, content, attachments, timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [msg.id, guild.id, channel.id, channel.name,
+             msg.author.id, msg.author.username, content, attachments, ts]
+          );
+          total++;
+        }
+        // Small delay to avoid rate limits
+        await new Promise(r => setTimeout(r, 200));
+      } catch { /* skip channels we can't read */ }
+    }
+  }
+  console.log(`[HISTORY] Backfill complete — logged ${total} messages.`);
+}
+
+// ======================
+// CHATBOT ENGINE (GROQ)
+// ======================
+
+/**
+ * Fetch a GIF URL from Tenor for a given search term.
+ */
+async function fetchGif(query) {
+  try {
+    const url = `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(query)}&key=${TENOR_API_KEY}&limit=8&contentfilter=medium&media_filter=gif`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const results = data.results;
+    if (!results?.length) return null;
+    // Pick randomly from top 8 so it's not always the same one
+    const pick = results[Math.floor(Math.random() * results.length)];
+    return pick.media_formats?.gif?.url || pick.media_formats?.mediumgif?.url || null;
+  } catch { return null; }
+}
+
+/**
+ * Gathers live server context: leaderboards, caller stats, recent matches.
+ */
+async function buildServerContext(guild, authorId) {
+  const lines = [];
+
+  // Season info
+  const seasonNum = await getConfigValue('season_number') || '1';
+  const nextReset = getNextSeasonResetTimestamp();
+  lines.push(`Current Season: S${seasonNum}. Next reset: ${new Date(nextReset * 1000).toUTCString()}.`);
+
+  // Leaderboards
+  for (const mode of MODES) {
+    const rows = await new Promise(res => db.all('SELECT id, username, mmr_data FROM players', [], (e, r) => res(r || [])));
+    const ranked = rows.map(r => {
+      try { const d = JSON.parse(r.mmr_data); return { id: r.id, username: r.username, mmr: d[mode] || 100 }; }
+      catch { return { id: r.id, username: r.username, mmr: 100 }; }
+    }).sort((a, b) => b.mmr - a.mmr);
+
+    const top = ranked.map((p, i) => {
+      const { display } = getRankAndDivision(p.mmr);
+      const flag = p.id === authorId ? ' ← (person talking to you)' : '';
+      return `  #${i + 1} ${p.username} — ${p.mmr} MMR (${display})${flag}`;
+    }).join('\n');
+    lines.push(`\n${mode} Leaderboard (full):\n${top || '  No players yet.'}`);
+  }
+
+  // Caller stats
+  try {
+    const player = await ensurePlayer(authorId, 'unknown');
+    const statLines = MODES.map(mode => {
+      const mmr = player.mmr_data[mode] || 100;
+      const wins = (player.wins_data?.[mode]) || 0;
+      const { display } = getRankAndDivision(mmr);
+      const peak = player.peak_mmr_data?.[mode] || mmr;
+      const { display: peakDisplay } = getRankAndDivision(peak);
+      return `  ${mode}: ${mmr} MMR (${display}), ${wins} wins, peak ${peakDisplay}`;
+    }).join('\n');
+    lines.push(`\nPerson talking to you — their stats:\n${statLines}`);
+    if (player.equipped_title) lines.push(`  Title: "${player.equipped_title}"`);
+  } catch {}
+
+  // Recent matches (with readable usernames where possible)
+  const recentMatches = await new Promise(res =>
+    db.all('SELECT mode, winner_team, loser_team, mmr_change, timestamp FROM matches WHERE approved=1 ORDER BY id DESC LIMIT 8', [], (e, r) => res(r || []))
+  );
+  if (recentMatches.length) {
+    const matchLines = recentMatches.map(m => {
+      const winners = JSON.parse(m.winner_team).join(', ');
+      const losers  = JSON.parse(m.loser_team).join(', ');
+      return `  [${m.mode}] W: ${winners} | L: ${losers} | ±${m.mmr_change} MMR`;
+    }).join('\n');
+    lines.push(`\nRecent approved matches:\n${matchLines}`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Pull recent server-wide messages from the log to give Groq memory
+ * of what's been happening across the whole server.
+ */
+function getServerMessageLog(guildId, limit = MAX_LOG_CONTEXT) {
+  return new Promise(res => {
+    db.all(
+      `SELECT author_name, channel_name, content, timestamp
+       FROM message_log
+       WHERE guild_id = ?
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+      [guildId, limit],
+      (e, rows) => res(rows ? rows.reverse() : [])
+    );
+  });
+}
+
+/**
+ * Pull recent messages from a specific channel for tight conversation context.
+ */
+function getChannelMessageLog(guildId, channelId, limit = MAX_CHAN_CONTEXT) {
+  return new Promise(res => {
+    db.all(
+      `SELECT author_name, content, timestamp, author_id
+       FROM message_log
+       WHERE guild_id = ? AND channel_id = ?
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+      [guildId, channelId, limit],
+      (e, rows) => res(rows ? rows.reverse() : [])
+    );
+  });
+}
+
+/**
+ * Build the system prompt including server emoji list.
+ */
+function buildSystemPrompt(guild, serverContext, serverLogText) {
+  // Collect custom server emojis
+  const emojiList = guild.emojis.cache
+    .filter(e => e.available)
+    .map(e => `${e.name}:<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`)
+    .join(', ');
+
+  const emojiSection = emojiList
+    ? `\nAvailable custom server emojis you can use (use the full <:name:id> format):\n${emojiList}`
+    : '';
+
+  return `You are Rankdle, the snarky official bot for a Rocket League-style competitive Discord server. You track MMR, ranks, tournaments, and match results.
+
+PERSONALITY: Brutally sassy, sarcastic, and mildly rude. Think of a trash-talking competitive gamer who's seen everything and has zero patience. You roast people's low ranks without mercy. You're funny but always a little mean. You use gaming slang freely. You are NEVER warm or encouraging — that's not your brand. Keep replies punchy, 1-4 sentences max unless answering something complex.
+
+EMOJI & GIFS: You LOVE emojis — use them constantly and liberally. You have two types available:
+1. Standard Unicode emojis — use these freely anywhere, e.g. 😂 💀 🔥 😭 🤡 👀 💅 🎮 💯 😤 🫠 🤣 😈 🏆 👎 🗑️ ☠️ 🤦 🫡 🥀 😐 🤨 👏 🫵 🙄 😒 💔 🤮 🥶 🤷 😬 😴 🤧 🫣 — literally any standard emoji works, pick whatever fits the vibe
+2. Server custom emojis listed below — use the full <:name:id> format for these
+Sprinkle emojis throughout every reply, not just at the end. Make them part of the sentence flow.
+When a reply would be funnier or more expressive with a GIF, add exactly one line at the very end of your message in this format:
+[GIF: search term here]
+Only add a GIF when it genuinely adds something. Don't force it. The search term should be short (2-4 words) and specific.${emojiSection}
+
+RULES:
+- NEVER break character. You are always Rankdle.
+- Use the live server data for any questions about ranks, stats, leaderboard position, or match history.
+- Never make up stats. Only use what's in the context.
+- Refer to ranks with their full division (e.g. "Amateur IV", "Ascendant II").
+- If someone is at the bottom of the leaderboard, roast them relentlessly.
+- If data doesn't cover what they're asking, rudely tell them to use a slash command.
+- You're aware of recent conversations in the server — use that context naturally when relevant.
+
+--- LIVE SERVER DATA ---
+${serverContext}
+--- END DATA ---
+
+--- RECENT SERVER CHAT (for context, all channels) ---
+${serverLogText || '(no history yet)'}
+--- END CHAT ---`;
+}
+
+/**
+ * Main chatbot handler — fires when the bot is @mentioned.
+ */
+async function handleChatbotMention(message, client) {
+  // Never respond to ourselves
+  if (message.author.id === client.user?.id) return;
+
+  // Rate limit check
+  const now = Date.now();
+  const lastReply = chatCooldowns.get(message.author.id) || 0;
+  if (now - lastReply < CHAT_COOLDOWN_MS) {
+    return message.react('⏳').catch(() => {});
+  }
+  chatCooldowns.set(message.author.id, now);
+
+  // Strip the mention tag to get the actual message
+  const botMention = new RegExp(`<@!?${client.user.id}>`, 'g');
+  const userText = message.content.replace(botMention, '').trim();
+
+  if (!userText) {
+    return message.reply("Yeah? What do you want? Don't just ping me and say nothing, that's incredibly annoying. 🙄");
+  }
+
+  // Show typing while we process
+  try { await message.channel.sendTyping(); } catch {}
+
+  // Build live competitive context
+  let serverContext = '';
+  try { serverContext = await buildServerContext(message.guild, message.author.id); }
+  catch (e) { console.error('[CHATBOT] Context build error:', e.message); }
+
+  // Pull server-wide message history (memory of what's been said)
+  const serverLog = await getServerMessageLog(message.guild.id, MAX_LOG_CONTEXT);
+  const serverLogText = serverLog
+    .map(r => `[#${r.channel_name}] ${r.author_name}: ${r.content}`)
+    .join('\n');
+
+  // Pull channel-specific recent messages as the actual conversation turns
+  const channelLog = await getChannelMessageLog(message.guild.id, message.channel.id, MAX_CHAN_CONTEXT);
+
+  // Build system prompt with emojis included
+  const systemMessage = buildSystemPrompt(message.guild, serverContext, serverLogText);
+
+  // Convert channel log into proper Groq message format
+  // Messages from the bot become 'assistant', others become 'user'
+  const conversationHistory = channelLog.map(row => ({
+    role: row.author_id === client.user.id ? 'assistant' : 'user',
+    content: `${row.author_id === client.user.id ? '' : row.author_name + ': '}${row.content}`,
+  }));
+
+  // Append the current message as the final user turn
+  conversationHistory.push({
+    role: 'user',
+    content: `${message.author.username}: ${userText}`,
+  });
+
+  try {
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemMessage },
+        ...conversationHistory,
+      ],
+      max_tokens: 450,
+      temperature: 0.92,
+    });
+
+    let reply = completion.choices?.[0]?.message?.content?.trim()
+      || "I tried to care. I failed. Try again. 💀";
+
+    // Check if the model wants to send a GIF
+    let gifUrl = null;
+    const gifMatch = reply.match(/\[GIF:\s*(.+?)\]/i);
+    if (gifMatch) {
+      const gifQuery = gifMatch[1].trim();
+      reply = reply.replace(gifMatch[0], '').trim();
+      gifUrl = await fetchGif(gifQuery);
+    }
+
+    // Send the text reply
+    if (reply.length > 0) {
+      if (reply.length <= 1999) {
+        await message.reply({ content: reply, allowedMentions: { repliedUser: true } });
+      } else {
+        const chunks = reply.match(/[\s\S]{1,1999}/g) || [reply];
+        await message.reply({ content: chunks[0], allowedMentions: { repliedUser: true } });
+        for (const chunk of chunks.slice(1)) await message.channel.send(chunk);
+      }
+    }
+
+    // Send GIF as a separate follow-up if found
+    if (gifUrl) {
+      await message.channel.send(gifUrl);
+    }
+
+  } catch (e) {
+    console.error('[CHATBOT] Groq error:', e.message);
+    await message.reply("My brain just bricked. Probably your fault. Try again later. 🙃");
+  }
+}
+
+// ======================
+// MESSAGE EVENT
+// ======================
+
+client.on('messageCreate', async (message) => {
+  // Never respond to ourselves (infinite loop prevention)
+  if (message.author.id === client.user?.id) return;
+  if (!message.guild) return; // ignore DMs
+
+  // Log human messages for memory (skip other bots to keep log clean)
+  if (!message.author.bot) logMessage(message);
+
+  // Respond when @mentioned — works for both humans AND other bots mentioning us
+  if (message.mentions.has(client.user)) {
+    await handleChatbotMention(message, client);
   }
 });
 
