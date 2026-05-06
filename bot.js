@@ -26,7 +26,7 @@ if (!BOT_TOKEN || !APPLICATION_ID || !BOT_OWNER_ID) {
   process.exit(1);
 }
 
-const GROQ_API_KEY = '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';
+const GROQ_API_KEY = process.env.GROQ_API;
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 // Tenor GIF API (free tier) — swap key at tenor.com/developers if needed
