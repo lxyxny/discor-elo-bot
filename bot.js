@@ -15,7 +15,9 @@ const cron = require('node-cron');
 const BOT_OWNER_ID = process.env.BOT_OWNER_ID;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const APPLICATION_ID = process.env.APPLICATION_ID;
-const GAME_ROOM_CHANNEL_ID = '1496461396546814032';
+// Game room channel is now stored in DB config via /set_gameroom_channel
+// Falls back to this default if never configured
+const DEFAULT_GAME_ROOM_CHANNEL_ID = '1496461396546814032';
 
 if (!BOT_TOKEN || !APPLICATION_ID || !BOT_OWNER_ID) {
   console.error('❌ Missing required environment variables. Check your .env file.');
@@ -161,6 +163,22 @@ db.serialize(() => {
     if (!row) db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('season_number', '1')");
   });
 
+  // rank_roles: maps each tier name to a Discord role ID (owner-configurable)
+  db.run(`CREATE TABLE IF NOT EXISTS rank_roles (
+    tier TEXT PRIMARY KEY,
+    role_id TEXT NOT NULL
+  )`);
+
+  // matchmaking_queue: tracks active /matchmake requests
+  db.run(`CREATE TABLE IF NOT EXISTS matchmaking_queue (
+    player_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    mmr INTEGER NOT NULL,
+    message_id TEXT,
+    channel_id TEXT,
+    queued_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
   // Safe migrations for existing databases
   db.run(`ALTER TABLE players ADD COLUMN wins_data TEXT DEFAULT '{}'`, () => {});
   db.run(`ALTER TABLE players ADD COLUMN peak_mmr_data TEXT DEFAULT '{}'`, () => {});
@@ -300,20 +318,48 @@ function calculateMMRChanges(winnerPlayers, loserPlayers, mode) {
 
 const TIER_ROLE_NAMES = RANK_TIERS.map(t => t.name);
 
+/**
+ * Returns a map of { tierName -> roleId } from the rank_roles DB table.
+ */
+function getRankRoleMap() {
+  return new Promise((resolve) => {
+    db.all('SELECT tier, role_id FROM rank_roles', [], (err, rows) => {
+      const map = {};
+      if (!err && rows) rows.forEach(r => { map[r.tier] = r.role_id; });
+      resolve(map);
+    });
+  });
+}
+
 async function syncPlayerRoles(guild, userId, mmr) {
   if (!guild) return;
   try {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (!member) return;
     const { tier } = getRankAndDivision(mmr);
+    const roleMap = await getRankRoleMap();
 
+    // Remove all known rank roles
     for (const tierName of TIER_ROLE_NAMES) {
-      const role = guild.roles.cache.find(r => r.name === `🏅 ${tierName}`);
-      if (role && member.roles.cache.has(role.id)) await member.roles.remove(role).catch(() => {});
+      // Try configured role ID first
+      const configuredId = roleMap[tierName];
+      if (configuredId) {
+        const role = guild.roles.cache.get(configuredId);
+        if (role && member.roles.cache.has(role.id)) await member.roles.remove(role).catch(() => {});
+      }
+      // Also remove auto-named fallback roles
+      const fallbackRole = guild.roles.cache.find(r => r.name === `🏅 ${tierName}`);
+      if (fallbackRole && member.roles.cache.has(fallbackRole.id)) await member.roles.remove(fallbackRole).catch(() => {});
     }
 
-    let targetRole = guild.roles.cache.find(r => r.name === `🏅 ${tier}`);
-    if (!targetRole) {
+    // Apply new tier role
+    const configuredRoleId = roleMap[tier];
+    let targetRole = configuredRoleId
+      ? guild.roles.cache.get(configuredRoleId)
+      : guild.roles.cache.find(r => r.name === `🏅 ${tier}`);
+
+    if (!targetRole && !configuredRoleId) {
+      // Auto-create fallback role only if no manual role configured
       targetRole = await guild.roles.create({ name: `🏅 ${tier}`, color: RANK_COLORS[tier] || 0x808080, reason: 'Auto-created rank role' }).catch(() => null);
     }
     if (targetRole) await member.roles.add(targetRole).catch(() => {});
