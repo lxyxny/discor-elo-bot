@@ -1,21 +1,23 @@
 {
-  "dependencies": {
-    "discord.js": "^14.15.3",
-    "dotenv": "^16.4.5",
-    "groq-sdk": "^0.7.0",
-    "node-cron": "^3.0.3",
-    "sqlite3": "^5.1.7"
-  },
   "name": "discord-elo-bot",
   "version": "1.0.0",
   "description": "",
   "main": "bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.3",
+    "dotenv": "^17.4.2",
+    "groq-sdk": "^0.21.0",
+    "node-cron": "^4.2.1",
+    "sqlite3": "^5.1.7"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
